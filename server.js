@@ -303,6 +303,21 @@ app.delete('/api/chat/:id', async (req, res) => {
 //  REFERIDOS
 // ══════════════════════════════════════════════════════
 
+// Get ALL refs grouped by code (for admin panel)
+app.get('/api/refs', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT referrer_code, referred_username FROM refs');
+    const result = {};
+    rows.forEach(r => {
+      if (!result[r.referrer_code]) result[r.referrer_code] = [];
+      result[r.referrer_code].push(r.referred_username);
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/refs/:code', async (req, res) => {
   try {
     const { rows } = await pool.query(
