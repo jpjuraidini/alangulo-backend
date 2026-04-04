@@ -242,6 +242,26 @@ app.post('/api/results', async (req, res) => {
   }
 });
 
+// Register referral separately (from welcome modal)
+app.post('/api/refs_register', async (req, res) => {
+  const { username, refCode } = req.body;
+  if (!username || !refCode) return res.json({ ok: false });
+  try {
+    const ref = await pool.query(
+      'SELECT username FROM users WHERE code = $1', [refCode.toUpperCase()]
+    );
+    if (ref.rows.length && ref.rows[0].username !== username) {
+      await pool.query(
+        'INSERT INTO refs (referrer_code, referred_username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [refCode.toUpperCase(), username]
+      );
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════
 //  CHAT
 // ══════════════════════════════════════════════════════
