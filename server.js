@@ -2,16 +2,24 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 require('dotenv').config();
- 
+
 const app = express();
 app.use(cors());
 app.use(express.json());
- 
+
+// Prevent caching of API responses
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  INIT DB — crea las tablas si no existen
 // ══════════════════════════════════════════════════════
@@ -24,33 +32,33 @@ async function initDB() {
       code CHAR(3) UNIQUE NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
- 
+
     CREATE TABLE IF NOT EXISTS picks (
       username TEXT REFERENCES users(username) ON DELETE CASCADE,
       data JSONB NOT NULL DEFAULT '{"sc":{},"br":{}}',
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (username)
     );
- 
+
     CREATE TABLE IF NOT EXISTS results (
       id INT PRIMARY KEY DEFAULT 1,
       data JSONB NOT NULL DEFAULT '{}',
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
- 
+
     CREATE TABLE IF NOT EXISTS chat (
       id SERIAL PRIMARY KEY,
       username TEXT NOT NULL,
       message TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
- 
+
     CREATE TABLE IF NOT EXISTS refs (
       referrer_code CHAR(3) NOT NULL,
       referred_username TEXT NOT NULL,
       PRIMARY KEY (referrer_code, referred_username)
     );
- 
+
     -- Insert default admin if not exists
     INSERT INTO users (username, pin, is_admin, code)
     VALUES ('admin', '0000', TRUE, 'ADM')
@@ -58,11 +66,11 @@ async function initDB() {
   `);
   console.log('✅ DB inicializada');
 }
- 
+
 // ══════════════════════════════════════════════════════
 //  AUTH
 // ══════════════════════════════════════════════════════
- 
+
 // Login
 app.post('/api/login', async (req, res) => {
   const { username, pin, refCode } = req.body;
@@ -74,7 +82,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Usuario o PIN incorrecto' });
     }
     const user = rows[0];
- 
+
     // Registrar referido si viene con código
     if (refCode && refCode.length === 3) {
       const ref = await pool.query(
@@ -87,12 +95,12 @@ app.post('/api/login', async (req, res) => {
         );
       }
     }
- 
+
     // Asegura que tenga fila en picks
     await pool.query(
       'INSERT INTO picks (username) VALUES ($1) ON CONFLICT DO NOTHING', [username]
     );
- 
+
     res.json({
       username: user.username,
       is_admin: user.is_admin,
@@ -103,11 +111,11 @@ app.post('/api/login', async (req, res) => {
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  USUARIOS (admin)
 // ══════════════════════════════════════════════════════
- 
+
 // Obtener todos los usuarios
 app.get('/api/users', async (req, res) => {
   try {
@@ -119,7 +127,7 @@ app.get('/api/users', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // Crear usuario
 app.post('/api/users', async (req, res) => {
   const { username, pin, code } = req.body;
@@ -138,7 +146,7 @@ app.post('/api/users', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // Eliminar usuario
 app.delete('/api/users/:username', async (req, res) => {
   try {
@@ -149,7 +157,7 @@ app.delete('/api/users/:username', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // Cambiar PIN
 app.patch('/api/users/:username/pin', async (req, res) => {
   const { pin } = req.body;
@@ -161,11 +169,11 @@ app.patch('/api/users/:username/pin', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  PICKS
 // ══════════════════════════════════════════════════════
- 
+
 // Obtener picks de un usuario
 app.get('/api/picks/:username', async (req, res) => {
   try {
@@ -177,7 +185,7 @@ app.get('/api/picks/:username', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // Guardar picks de un usuario
 app.post('/api/picks/:username', async (req, res) => {
   const { data } = req.body;
@@ -193,7 +201,7 @@ app.post('/api/picks/:username', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // Obtener picks de todos (para ranking)
 app.get('/api/picks', async (req, res) => {
   try {
@@ -205,11 +213,11 @@ app.get('/api/picks', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  RESULTADOS (admin)
 // ══════════════════════════════════════════════════════
- 
+
 app.get('/api/results', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT data FROM results WHERE id = 1');
@@ -218,7 +226,7 @@ app.get('/api/results', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 app.post('/api/results', async (req, res) => {
   const { data } = req.body;
   try {
@@ -233,11 +241,11 @@ app.post('/api/results', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  CHAT
 // ══════════════════════════════════════════════════════
- 
+
 app.get('/api/chat', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -248,7 +256,7 @@ app.get('/api/chat', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 app.post('/api/chat', async (req, res) => {
   const { username, message } = req.body;
   try {
@@ -261,7 +269,7 @@ app.post('/api/chat', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 app.delete('/api/chat/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM chat WHERE id = $1', [req.params.id]);
@@ -270,11 +278,11 @@ app.delete('/api/chat/:id', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  REFERIDOS
 // ══════════════════════════════════════════════════════
- 
+
 app.get('/api/refs/:code', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -286,7 +294,7 @@ app.get('/api/refs/:code', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
- 
+
 // ══════════════════════════════════════════════════════
 //  START
 // ══════════════════════════════════════════════════════
