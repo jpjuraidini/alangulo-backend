@@ -1,3 +1,4 @@
+
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
@@ -57,6 +58,21 @@ async function initDB() {
       referrer_code CHAR(3) NOT NULL,
       referred_username TEXT NOT NULL,
       PRIMARY KEY (referrer_code, referred_username)
+    );
+
+    CREATE TABLE IF NOT EXISTS groups_q (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      code CHAR(6) UNIQUE NOT NULL,
+      owner TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_id INT NOT NULL REFERENCES groups_q(id) ON DELETE CASCADE,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (group_id, username)
     );
 
     -- Insert default admin if not exists
@@ -327,6 +343,131 @@ app.get('/api/refs/:code', async (req, res) => {
     res.json(rows.map(r => r.referred_username));
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  GRUPOS
+// ══════════════════════════════════════════════════════
+
+// Generar código único de 6 caracteres
+function genGroupCode(){
+  return Math.random().toString(36).substring(2,8).toUpperCase();
+}
+
+// Crear grupo
+app.post('/api/groups', async (req, res) => {
+  const { name, username } = req.body;
+  if(!name||!username) return res.status(400).json({error:'Faltan datos'});
+  let code, attempts=0;
+  do {
+    code = genGroupCode();
+    attempts++;
+    if(attempts>10) return res.status(500).json({error:'No se pudo generar código único'});
+    const exists = await pool.query('SELECT id FROM groups_q WHERE code=$1',[code]);
+    if(!exists.rows.length) break;
+  } while(true);
+
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO groups_q (name,code,owner) VALUES ($1,$2,$3) RETURNING *',
+      [name, code, username]
+    );
+    const g = rows[0];
+    // El creador automáticamente es miembro
+    await pool.query(
+      'INSERT INTO group_members (group_id,username) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [g.id, username]
+    );
+    res.json({id:g.id, name:g.name, code:g.code, owner:g.owner});
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+// Unirse a un grupo por código
+app.post('/api/groups/join', async (req, res) => {
+  const { code, username } = req.body;
+  if(!code||!username) return res.status(400).json({error:'Faltan datos'});
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM groups_q WHERE code=$1', [code.toUpperCase()]
+    );
+    if(!rows.length) return res.status(404).json({error:'Código incorrecto — grupo no encontrado'});
+    const g = rows[0];
+    await pool.query(
+      'INSERT INTO group_members (group_id,username) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [g.id, username]
+    );
+    res.json({id:g.id, name:g.name, code:g.code, owner:g.owner});
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+// Obtener grupos de un usuario
+app.get('/api/groups/user/:username', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT g.id, g.name, g.code, g.owner, g.created_at,
+             COUNT(gm2.username) as member_count
+      FROM groups_q g
+      JOIN group_members gm ON gm.group_id = g.id AND gm.username = $1
+      JOIN group_members gm2 ON gm2.group_id = g.id
+      GROUP BY g.id
+      ORDER BY g.created_at ASC
+    `, [req.params.username]);
+    res.json(rows);
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+// Obtener miembros y picks de un grupo (para ranking)
+app.get('/api/groups/:id/ranking', async (req, res) => {
+  try {
+    const { rows: members } = await pool.query(`
+      SELECT gm.username FROM group_members gm
+      WHERE gm.group_id = $1
+    `, [req.params.id]);
+    const usernames = members.map(m=>m.username);
+    // Get picks for all members
+    const picksResult = usernames.length
+      ? await pool.query('SELECT username, data FROM picks WHERE username = ANY($1)', [usernames])
+      : {rows:[]};
+    const picks = {};
+    picksResult.rows.forEach(r=>{ picks[r.username]=r.data; });
+    res.json({members: usernames, picks});
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+// Salir de un grupo
+app.delete('/api/groups/:id/leave', async (req, res) => {
+  const { username } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
+    if(!rows.length) return res.status(404).json({error:'Grupo no encontrado'});
+    if(rows[0].owner===username) return res.status(400).json({error:'El creador no puede abandonar el grupo'});
+    await pool.query('DELETE FROM group_members WHERE group_id=$1 AND username=$2',[req.params.id, username]);
+    res.json({ok:true});
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+// Eliminar grupo (solo el creador)
+app.delete('/api/groups/:id', async (req, res) => {
+  const { username } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
+    if(!rows.length) return res.status(404).json({error:'Grupo no encontrado'});
+    if(rows[0].owner!==username) return res.status(403).json({error:'Solo el creador puede eliminar el grupo'});
+    await pool.query('DELETE FROM groups_q WHERE id=$1',[req.params.id]);
+    res.json({ok:true});
+  } catch(e) {
+    res.status(500).json({error:e.message});
   }
 });
 
