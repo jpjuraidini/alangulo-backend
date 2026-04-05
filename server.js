@@ -443,6 +443,21 @@ app.get('/api/groups/:id/ranking', async (req, res) => {
   }
 });
 
+// Eliminar miembro del grupo (solo el owner)
+app.delete('/api/groups/:id/member/:username', async (req, res) => {
+  const { requester } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
+    if(!rows.length) return res.status(404).json({error:'Grupo no encontrado'});
+    if(rows[0].owner!==requester) return res.status(403).json({error:'Solo el creador puede eliminar miembros'});
+    if(req.params.username===requester) return res.status(400).json({error:'No puedes eliminarte a ti mismo'});
+    await pool.query('DELETE FROM group_members WHERE group_id=$1 AND username=$2',[req.params.id, req.params.username]);
+    res.json({ok:true});
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
 // Salir de un grupo
 app.delete('/api/groups/:id/leave', async (req, res) => {
   const { username } = req.body;
