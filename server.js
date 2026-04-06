@@ -640,6 +640,111 @@ app.delete('/api/ranking/snapshot/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+//  ESTADÍSTICAS GLOBALES
+// ══════════════════════════════════════════════════════
+app.get('/api/stats', async (req, res) => {
+  try {
+    const [picksRows, resultsRow, usersRow] = await Promise.all([
+      pool.query('SELECT username, data FROM picks'),
+      pool.query('SELECT data FROM results WHERE id = 1'),
+      pool.query('SELECT username, is_admin FROM users')
+    ]);
+
+    const results = resultsRow.rows[0]?.data || {};
+    const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+    const allPicks = picksRows.rows.filter(r => !admins.has(r.username));
+    const total = allPicks.length;
+    if(!total) return res.json({ empty: true });
+
+    const rSC = results.sc || {};
+    const rBR = results.bracket || {};
+
+    // 1. Aciertos y exactos por partido de grupos
+    const matchStats = {};
+    Object.entries(rSC).forEach(([id, rr]) => {
+      if(rr?.h==null || rr?.a==null) return;
+      const rRes = rr.h>rr.a?'h':rr.h<rr.a?'a':'e';
+      let correct=0, exact=0, picked=0;
+      allPicks.forEach(p => {
+        const ms = p.data?.sc?.[id];
+        if(!ms) return;
+        picked++;
+        const mRes = +ms.h>+ms.a?'h':+ms.h<+ms.a?'a':'e';
+        if(mRes===rRes) correct++;
+        if(+ms.h===rr.h && +ms.a===rr.a) exact++;
+      });
+      if(picked>0) matchStats[id] = { correct, exact, picked, pct: Math.round(correct/picked*100) };
+    });
+
+    // 2. Partido más acertado y más exacto
+    const sortedByPct = Object.entries(matchStats).sort((a,b)=>b[1].pct-a[1].pct);
+    const sortedByExact = Object.entries(matchStats).sort((a,b)=>b[1].exact-a[1].exact);
+    const mostCorrect = sortedByPct[0] ? { id: sortedByPct[0][0], ...sortedByPct[0][1] } : null;
+    const mostExact = sortedByExact[0] ? { id: sortedByExact[0][0], ...sortedByExact[0][1] } : null;
+    const leastCorrect = sortedByPct.length ? { id: sortedByPct[sortedByPct.length-1][0], ...sortedByPct[sortedByPct.length-1][1] } : null;
+
+    // 3. Equipo más votado como campeón (último partido del bracket)
+    const champVotes = {};
+    allPicks.forEach(p => {
+      const br = p.data?.br || {};
+      const keys = Object.keys(br);
+      // Find the pick with highest match number (the final)
+      const finalKey = keys.sort().reverse()[0];
+      if(finalKey && br[finalKey]){
+        const team = br[finalKey];
+        champVotes[team] = (champVotes[team]||0) + 1;
+      }
+    });
+    const topChamp = Object.entries(champVotes).sort((a,b)=>b[1]-a[1]).slice(0,3)
+      .map(([team, votes]) => ({ team, votes, pct: Math.round(votes/total*100) }));
+
+    // 4. Exactos en grupos por usuario
+    const exactByUser = allPicks.map(p => {
+      let ex=0;
+      Object.entries(rSC).forEach(([id,rr]) => {
+        if(rr?.h==null||rr?.a==null) return;
+        const ms = p.data?.sc?.[id];
+        if(ms && +ms.h===rr.h && +ms.a===rr.a) ex++;
+      });
+      return { name: p.username, exact: ex };
+    }).sort((a,b)=>b.exact-a.exact).filter(u=>u.exact>0).slice(0,5);
+
+    // 5. % acierto global en grupos
+    let totalCorrect=0, totalPossible=0;
+    allPicks.forEach(p => {
+      Object.entries(rSC).forEach(([id,rr]) => {
+        if(rr?.h==null||rr?.a==null) return;
+        const ms = p.data?.sc?.[id];
+        if(!ms) return;
+        totalPossible++;
+        const rRes = rr.h>rr.a?'h':rr.h<rr.a?'a':'e';
+        const mRes = +ms.h>+ms.a?'h':+ms.h<+ms.a?'a':'e';
+        if(mRes===rRes) totalCorrect++;
+      });
+    });
+    const globalPct = totalPossible>0 ? Math.round(totalCorrect/totalPossible*100) : 0;
+
+    // 6. Partidos jugados con resultados
+    const matchesWithResults = Object.keys(rSC).filter(id => rSC[id]?.h!=null).length;
+    const bracketWithResults = Object.keys(rBR).filter(id => rBR[id]?.winner).length;
+
+    res.json({
+      total,
+      matchesWithResults,
+      bracketWithResults,
+      globalPct,
+      mostCorrect,
+      mostExact,
+      leastCorrect,
+      topChamp,
+      exactByUser
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
 //  USUARIOS CONECTADOS — SSE
 // ══════════════════════════════════════════════════════
 const onlineUsers = new Map(); // username -> { res, lastSeen }
