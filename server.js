@@ -591,6 +591,51 @@ app.delete('/api/groups/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+//  USUARIOS CONECTADOS — SSE
+// ══════════════════════════════════════════════════════
+const onlineUsers = new Map(); // username -> { res, lastSeen }
+
+function broadcastOnlineCount() {
+  const count = onlineUsers.size;
+  const msg = `data: ${JSON.stringify({ type: 'online_count', count })}\n\n`;
+  onlineUsers.forEach(({ res }) => {
+    try { res.write(msg); } catch(e) {}
+  });
+}
+
+app.get('/api/online', (req, res) => {
+  const username = req.query.u || 'anon';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders();
+
+  // Send current count immediately
+  res.write(`data: ${JSON.stringify({ type: 'online_count', count: onlineUsers.size + 1 })}\n\n`);
+
+  // Register user
+  onlineUsers.set(username, { res, lastSeen: Date.now() });
+  broadcastOnlineCount();
+
+  // Keep alive every 20s
+  const keepAlive = setInterval(() => {
+    try { res.write('data: {"type":"ping"}\n\n'); } catch(e) {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    onlineUsers.delete(username);
+    broadcastOnlineCount();
+  });
+});
+
+// Simple count endpoint for polling fallback
+app.get('/api/online/count', (req, res) => {
+  res.json({ count: onlineUsers.size });
+});
+
+// ══════════════════════════════════════════════════════
 //  START
 // ══════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
