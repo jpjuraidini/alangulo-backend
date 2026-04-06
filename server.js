@@ -276,25 +276,42 @@ function calcScoreServer(picksData, results) {
   return { grupos: gr, bracket: br, total: gr + br };
 }
 
+// ══════════════════════════════════════════════════════
+//  RANKING CACHE
+// ══════════════════════════════════════════════════════
+let _rankingCache = null;
+let _rankingCacheAt = 0;
+const RANKING_TTL = 2 * 60 * 1000; // 2 minutos
+
+async function buildRanking() {
+  const [picksRows, resultsRow, usersRow] = await Promise.all([
+    pool.query('SELECT username, data FROM picks'),
+    pool.query('SELECT data FROM results WHERE id = 1'),
+    pool.query('SELECT username, is_admin FROM users')
+  ]);
+  const results = resultsRow.rows[0]?.data || {};
+  const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+  const board = picksRows.rows
+    .filter(r => !admins.has(r.username))
+    .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
+    .sort((a, b) => b.total - a.total);
+  _rankingCache = board;
+  _rankingCacheAt = Date.now();
+  return board;
+}
+
+function invalidateRankingCache() {
+  _rankingCache = null;
+  _rankingCacheAt = 0;
+}
+
 app.get('/api/ranking', async (req, res) => {
   try {
-    const [picksRows, resultsRow, usersRow] = await Promise.all([
-      pool.query('SELECT username, data FROM picks'),
-      pool.query('SELECT data FROM results WHERE id = 1'),
-      pool.query('SELECT username, is_admin FROM users')
-    ]);
-
-    const results = resultsRow.rows[0]?.data || {};
-    const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
-
-    const board = picksRows.rows
-      .filter(r => !admins.has(r.username))
-      .map(r => {
-        const sc = calcScoreServer(r.data, results);
-        return { name: r.username, ...sc };
-      })
-      .sort((a, b) => b.total - a.total);
-
+    const now = Date.now();
+    if(_rankingCache && (now - _rankingCacheAt) < RANKING_TTL){
+      return res.json(_rankingCache);
+    }
+    const board = await buildRanking();
     res.json(board);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -324,6 +341,9 @@ app.post('/api/results', async (req, res) => {
       [JSON.stringify(data)]
     );
     res.json({ ok: true });
+    invalidateRankingCache();
+    // Rebuild cache in background for next request
+    buildRanking().catch(()=>{});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
