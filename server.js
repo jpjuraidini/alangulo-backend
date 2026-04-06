@@ -74,6 +74,13 @@ async function initDB() {
       PRIMARY KEY (group_id, username)
     );
 
+    CREATE TABLE IF NOT EXISTS ranking_history (
+      id SERIAL PRIMARY KEY,
+      snapshot JSONB NOT NULL,
+      label TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     -- Insert default admin if not exists
     INSERT INTO users (username, pin, is_admin, code)
     VALUES ('admin', '0000', TRUE, 'ADM')
@@ -587,6 +594,48 @@ app.delete('/api/groups/:id', async (req, res) => {
     res.json({ok:true});
   } catch(e) {
     res.status(500).json({error:e.message});
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  RANKING HISTORY
+// ══════════════════════════════════════════════════════
+
+// Guardar snapshot del ranking (lo llama el admin)
+app.post('/api/ranking/snapshot', async (req, res) => {
+  const { label } = req.body;
+  if(!label) return res.status(400).json({ error: 'Se requiere un label' });
+  try {
+    const board = await buildRanking();
+    await pool.query(
+      'INSERT INTO ranking_history (snapshot, label) VALUES ($1, $2)',
+      [JSON.stringify(board), label]
+    );
+    res.json({ ok: true, count: board.length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Obtener todos los snapshots
+app.get('/api/ranking/history', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, label, created_at, snapshot FROM ranking_history ORDER BY created_at ASC'
+    );
+    res.json(rows);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Eliminar un snapshot
+app.delete('/api/ranking/snapshot/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM ranking_history WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
