@@ -1,4 +1,3 @@
-
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
@@ -225,6 +224,78 @@ app.get('/api/picks', async (req, res) => {
     const result = {};
     rows.forEach(r => { result[r.username] = r.data; });
     res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  RANKING — calculado en el servidor
+// ══════════════════════════════════════════════════════
+
+const PTS_SERVER = {
+  grpResult: 1, grpExact: 2,
+  r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], f:[10,20]
+};
+
+function calcScoreServer(picksData, results) {
+  let gr = 0, br = 0;
+  const up = picksData || { sc: {}, br: {} };
+
+  // Grupos
+  if (results.sc) {
+    Object.entries(results.sc).forEach(([id, rr]) => {
+      if (rr?.h == null || rr?.a == null) return;
+      const ms = up.sc?.[id];
+      if (!ms) return;
+      const rRes = rr.h > rr.a ? 'h' : rr.h < rr.a ? 'a' : 'e';
+      const mRes = ms.h > ms.a ? 'h' : ms.h < ms.a ? 'a' : 'e';
+      if (rRes === mRes) {
+        gr += PTS_SERVER.grpResult;
+        if (+ms.h === rr.h && +ms.a === rr.a) gr += PTS_SERVER.grpExact;
+      }
+    });
+  }
+
+  // Eliminatoria
+  if (results.bracket) {
+    Object.entries(results.bracket).forEach(([id, rr]) => {
+      if (!rr?.winner) return;
+      const rk = id.split('_')[0];
+      const [winPts, exactBonus] = PTS_SERVER[rk] || [0, 0];
+      const mw = up.br?.[id];
+      if (!mw) return;
+      if (mw === rr.winner) {
+        br += winPts;
+        const ms = up.sc?.[id];
+        if (ms && rr.h != null && +ms.h === rr.h && +ms.a === rr.a) br += exactBonus;
+      }
+    });
+  }
+
+  return { grupos: gr, bracket: br, total: gr + br };
+}
+
+app.get('/api/ranking', async (req, res) => {
+  try {
+    const [picksRows, resultsRow, usersRow] = await Promise.all([
+      pool.query('SELECT username, data FROM picks'),
+      pool.query('SELECT data FROM results WHERE id = 1'),
+      pool.query('SELECT username, is_admin FROM users')
+    ]);
+
+    const results = resultsRow.rows[0]?.data || {};
+    const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+
+    const board = picksRows.rows
+      .filter(r => !admins.has(r.username))
+      .map(r => {
+        const sc = calcScoreServer(r.data, results);
+        return { name: r.username, ...sc };
+      })
+      .sort((a, b) => b.total - a.total);
+
+    res.json(board);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
