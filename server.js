@@ -728,6 +728,43 @@ app.get('/api/stats', async (req, res) => {
     const matchesWithResults = Object.keys(rSC).filter(id => rSC[id]?.h!=null).length;
     const bracketWithResults = Object.keys(rBR).filter(id => rBR[id]?.winner).length;
 
+    // 7. La Tumba — bracket completo, menos puntos
+    const BRACKET_MATCH_IDS = ['r32','r16','qf','sf','f'];
+    function hasBracketComplete(picksData){
+      const br = picksData?.br || {};
+      return Object.keys(br).length >= 31; // 32 partidos eliminatorios
+    }
+    const withBracket = allPicks.filter(p => hasBracketComplete(p.data));
+    let tumba = null;
+    if(withBracket.length){
+      const ranked = withBracket.map(p=>({name:p.username,...calcScoreServer(p.data,results)}))
+        .sort((a,b)=>a.total-b.total);
+      tumba = ranked[0];
+    }
+
+    // 8. El Básico — quien más veces puso 2-0
+    const basicoCounts = allPicks.map(p=>{
+      let count=0;
+      Object.values(p.data?.sc||{}).forEach(ms=>{
+        if(+ms.h===2 && +ms.a===0) count++;
+      });
+      return { name: p.username, count };
+    }).sort((a,b)=>b.count-a.count).filter(u=>u.count>0);
+    const basico = basicoCounts[0] || null;
+
+    // 9. El más goleador — quien predijo más goles en total
+    const goleadorCounts = allPicks.map(p=>{
+      let goals=0;
+      Object.values(p.data?.sc||{}).forEach(ms=>{
+        goals += (+ms.h||0) + (+ms.a||0);
+      });
+      return { name: p.username, goals };
+    }).sort((a,b)=>b.goals-a.goals);
+    const goleador = goleadorCounts[0] || null;
+
+    // 10. El Aburrido — quien predijo menos goles en total
+    const aburrido = goleadorCounts.length ? goleadorCounts[goleadorCounts.length-1] : null;
+
     res.json({
       total,
       matchesWithResults,
@@ -737,7 +774,11 @@ app.get('/api/stats', async (req, res) => {
       mostExact,
       leastCorrect,
       topChamp,
-      exactByUser
+      exactByUser,
+      tumba,
+      basico,
+      goleador,
+      aburrido
     });
   } catch(e) {
     res.status(500).json({ error: e.message });
