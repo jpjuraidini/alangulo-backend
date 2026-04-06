@@ -391,6 +391,19 @@ app.delete('/api/chat/:id', async (req, res) => {
 // ══════════════════════════════════════════════════════
 
 // Get ALL refs grouped by code (for admin panel)
+// Verificar si un usuario ya tiene referidor
+app.get('/api/refs/check/:username', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT referrer_code FROM refs WHERE referred_username = $1',
+      [req.params.username]
+    );
+    res.json({ hasReferrer: rows.length > 0 });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/refs', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT referrer_code, referred_username FROM refs');
