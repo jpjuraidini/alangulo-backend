@@ -582,26 +582,48 @@ app.post('/api/wall/:id/comments', async (req, res) => {
 
 // Delete comment (own or admin)
 app.delete('/api/wall/comment/:id', async (req, res) => {
-  const { username, isAdmin } = req.body;
+  const { username, is_admin, isAdmin } = req.body;
+  const admin = is_admin || isAdmin;
   try {
-    const { rows } = await pool.query('SELECT username, delete_count, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1 AND deleted=FALSE', [req.params.id]);
     if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
     const comment = rows[0];
-    if(!isAdmin && comment.username !== username) return res.status(403).json({ error: 'Sin permiso' });
+    if(!admin && comment.username !== username) return res.status(403).json({ error: 'Sin permiso' });
 
-    if(isAdmin){
-      const newCount = comment.delete_count + 1;
-      const muted = newCount >= 2;
-      await pool.query('UPDATE wall_comments SET deleted=TRUE, delete_count=$1 WHERE id=$2', [newCount, req.params.id]);
-      if(muted){
-        await pool.query('UPDATE wall_posts SET muted=TRUE WHERE username=$1', [comment.username]);
-        await pool.query('UPDATE wall_comments SET deleted=TRUE WHERE username=$1', [comment.username]);
-      }
-      res.json({ ok: true, muted, deleteCount: newCount });
-    } else {
-      await pool.query('UPDATE wall_comments SET deleted=TRUE WHERE id=$1 AND username=$2', [req.params.id, username]);
-      res.json({ ok: true });
+    if(admin && comment.username !== username){
+      // Add strike
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE
+        SET strikes = wall_strikes.strikes + 1,
+            muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE wall_strikes.muted END
+      `, [comment.username]);
     }
+    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alias plural route
+app.delete('/api/wall/comments/:id', async (req, res) => {
+  req.url = req.url.replace('/comments/', '/comment/');
+  const { username, is_admin, isAdmin } = req.body;
+  const admin = is_admin || isAdmin;
+  try {
+    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1 AND deleted=FALSE', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
+    const comment = rows[0];
+    if(!admin && comment.username !== username) return res.status(403).json({ error: 'Sin permiso' });
+    if(admin && comment.username !== username){
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE
+        SET strikes = wall_strikes.strikes + 1,
+            muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE wall_strikes.muted END
+      `, [comment.username]);
+    }
+    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -903,30 +925,7 @@ app.post('/api/wall/:id/comment', async (req, res) => {
 });
 
 // Delete comment (own or admin)
-app.delete('/api/wall/comment/:id', async (req, res) => {
-  const { username, is_admin } = req.body;
-  try {
-    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
-    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
-    if(!is_admin && rows[0].username !== username) return res.status(403).json({ error: 'Sin permiso' });
 
-    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
-
-    // Strike if admin deleted someone else's comment
-    if(is_admin && rows[0].username !== username){
-      await pool.query(`
-        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
-        ON CONFLICT (username) DO UPDATE SET
-          strikes = wall_strikes.strikes + 1,
-          muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE FALSE END
-      `, [rows[0].username]);
-    }
-
-    res.json({ ok: true });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // Get user strike status
 app.get('/api/wall/strikes/:username', async (req, res) => {
