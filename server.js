@@ -46,10 +46,31 @@ async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS chat (
+    CREATE TABLE IF NOT EXISTS wall_posts (
       id SERIAL PRIMARY KEY,
-      username TEXT NOT NULL,
-      message TEXT NOT NULL,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      deleted BOOLEAN DEFAULT FALSE,
+      delete_count INT DEFAULT 0,
+      muted BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_reactions (
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (post_id, username, emoji)
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_comments (
+      id SERIAL PRIMARY KEY,
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      parent_id INT REFERENCES wall_comments(id) ON DELETE CASCADE,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      deleted BOOLEAN DEFAULT FALSE,
+      delete_count INT DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
@@ -79,6 +100,66 @@ async function initDB() {
       snapshot JSONB NOT NULL,
       label TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_posts (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_reactions (
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (post_id, username)
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_comments (
+      id SERIAL PRIMARY KEY,
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      parent_id INT REFERENCES wall_comments(id) ON DELETE CASCADE,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_strikes (
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      strikes INT NOT NULL DEFAULT 0,
+      muted BOOLEAN DEFAULT FALSE,
+      PRIMARY KEY (username)
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_posts (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_reactions (
+      id SERIAL PRIMARY KEY,
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      username TEXT NOT NULL,
+      emoji TEXT NOT NULL,
+      UNIQUE(post_id, username, emoji)
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_comments (
+      id SERIAL PRIMARY KEY,
+      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
+      parent_id INT REFERENCES wall_comments(id) ON DELETE CASCADE,
+      username TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS wall_strikes (
+      username TEXT PRIMARY KEY,
+      strikes INT DEFAULT 0,
+      muted BOOLEAN DEFAULT FALSE
     );
 
     -- Insert default admin if not exists
@@ -377,40 +458,154 @@ app.post('/api/refs_register', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
-//  CHAT
+// ══════════════════════════════════════════════════════
+//  MURO
 // ══════════════════════════════════════════════════════
 
-app.get('/api/chat', async (req, res) => {
+// Get all posts with reactions and comment counts
+app.get('/api/wall', async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT id, username, message, created_at FROM chat ORDER BY created_at ASC LIMIT 200'
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const { rows: posts } = await pool.query(`
+      SELECT p.id, p.username, p.content, p.deleted, p.muted, p.created_at,
+             COUNT(DISTINCT c.id) FILTER (WHERE c.deleted=FALSE AND c.parent_id IS NULL) as comment_count
+      FROM wall_posts p
+      LEFT JOIN wall_comments c ON c.post_id = p.id
+      WHERE p.deleted = FALSE AND p.muted = FALSE
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+      LIMIT 100
+    `);
+
+    const { rows: reactions } = await pool.query(`
+      SELECT post_id, emoji, COUNT(*) as count, array_agg(username) as users
+      FROM wall_reactions
+      WHERE post_id = ANY($1)
+      GROUP BY post_id, emoji
+    `, [posts.map(p=>p.id)]);
+
+    const reactionMap = {};
+    reactions.forEach(r => {
+      if(!reactionMap[r.post_id]) reactionMap[r.post_id] = [];
+      reactionMap[r.post_id].push({ emoji: r.emoji, count: parseInt(r.count), users: r.users });
+    });
+
+    res.json(posts.map(p => ({ ...p, reactions: reactionMap[p.id] || [] })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/chat', async (req, res) => {
-  const { username, message } = req.body;
+// Create post
+app.post('/api/wall', async (req, res) => {
+  const { username, content } = req.body;
+  if(!username||!content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    // Check if muted
+    const { rows } = await pool.query('SELECT muted FROM wall_posts WHERE username=$1 AND muted=TRUE LIMIT 1', [username]);
+    if(rows.length) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+    const { rows: post } = await pool.query(
+      'INSERT INTO wall_posts (username, content) VALUES ($1, $2) RETURNING *',
+      [username, content.trim().slice(0,500)]
+    );
+    res.json(post[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete post (own or admin)
+app.delete('/api/wall/:id', async (req, res) => {
+  const { username, isAdmin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username, delete_count FROM wall_posts WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Post no encontrado' });
+    const post = rows[0];
+    if(!isAdmin && post.username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    if(isAdmin){
+      const newCount = post.delete_count + 1;
+      const muted = newCount >= 2;
+      await pool.query(
+        'UPDATE wall_posts SET deleted=TRUE, delete_count=$1 WHERE id=$2', [newCount, req.params.id]
+      );
+      if(muted){
+        // Mute all posts from this user
+        await pool.query('UPDATE wall_posts SET muted=TRUE WHERE username=$1', [post.username]);
+      }
+      res.json({ ok: true, muted, deleteCount: newCount });
+    } else {
+      await pool.query('UPDATE wall_posts SET deleted=TRUE WHERE id=$1 AND username=$2', [req.params.id, username]);
+      res.json({ ok: true });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Toggle reaction
+app.post('/api/wall/:id/react', async (req, res) => {
+  const { username, emoji } = req.body;
+  if(!username||!emoji) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    const existing = await pool.query(
+      'SELECT 1 FROM wall_reactions WHERE post_id=$1 AND username=$2 AND emoji=$3',
+      [req.params.id, username, emoji]
+    );
+    if(existing.rows.length){
+      await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2 AND emoji=$3',
+        [req.params.id, username, emoji]);
+      res.json({ action: 'removed' });
+    } else {
+      await pool.query('INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3)',
+        [req.params.id, username, emoji]);
+      res.json({ action: 'added' });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get comments for a post
+app.get('/api/wall/:id/comments', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, post_id, parent_id, username, content, deleted, created_at
+      FROM wall_comments
+      WHERE post_id=$1 AND deleted=FALSE
+      ORDER BY created_at ASC
+    `, [req.params.id]);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add comment
+app.post('/api/wall/:id/comments', async (req, res) => {
+  const { username, content, parent_id } = req.body;
+  if(!username||!content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
   try {
     const { rows } = await pool.query(
-      'INSERT INTO chat (username, message) VALUES ($1, $2) RETURNING *',
-      [username, message]
+      'INSERT INTO wall_comments (post_id, parent_id, username, content) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.params.id, parent_id||null, username, content.trim().slice(0,500)]
     );
     res.json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/chat/:id', async (req, res) => {
+// Delete comment (own or admin)
+app.delete('/api/wall/comment/:id', async (req, res) => {
+  const { username, isAdmin } = req.body;
   try {
-    await pool.query('DELETE FROM chat WHERE id = $1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const { rows } = await pool.query('SELECT username, delete_count, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
+    const comment = rows[0];
+    if(!isAdmin && comment.username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    if(isAdmin){
+      const newCount = comment.delete_count + 1;
+      const muted = newCount >= 2;
+      await pool.query('UPDATE wall_comments SET deleted=TRUE, delete_count=$1 WHERE id=$2', [newCount, req.params.id]);
+      if(muted){
+        await pool.query('UPDATE wall_posts SET muted=TRUE WHERE username=$1', [comment.username]);
+        await pool.query('UPDATE wall_comments SET deleted=TRUE WHERE username=$1', [comment.username]);
+      }
+      res.json({ ok: true, muted, deleteCount: newCount });
+    } else {
+      await pool.query('UPDATE wall_comments SET deleted=TRUE WHERE id=$1 AND username=$2', [req.params.id, username]);
+      res.json({ ok: true });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════════════════
@@ -598,6 +793,189 @@ app.delete('/api/groups/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+//  MURO — WALL
+// ══════════════════════════════════════════════════════
+
+// Get all posts with reactions and comments
+app.get('/api/wall', async (req, res) => {
+  try {
+    const { rows: posts } = await pool.query(
+      'SELECT id, username, content, created_at FROM wall_posts ORDER BY created_at DESC LIMIT 50'
+    );
+    if(!posts.length) return res.json([]);
+
+    const postIds = posts.map(p => p.id);
+
+    const [reactRows, commentRows, strikeRows] = await Promise.all([
+      pool.query('SELECT post_id, username, emoji FROM wall_reactions WHERE post_id = ANY($1)', [postIds]),
+      pool.query('SELECT id, post_id, parent_id, username, content, created_at FROM wall_comments WHERE post_id = ANY($1) ORDER BY created_at ASC', [postIds]),
+      pool.query('SELECT username, muted FROM wall_strikes')
+    ]);
+
+    const mutedSet = new Set(strikeRows.rows.filter(r=>r.muted).map(r=>r.username));
+
+    // Group reactions by post
+    const reactionsByPost = {};
+    reactRows.rows.forEach(r => {
+      if(!reactionsByPost[r.post_id]) reactionsByPost[r.post_id] = [];
+      reactionsByPost[r.post_id].push({ username: r.username, emoji: r.emoji });
+    });
+
+    // Group comments by post
+    const commentsByPost = {};
+    commentRows.rows.forEach(c => {
+      if(!commentsByPost[c.post_id]) commentsByPost[c.post_id] = [];
+      commentsByPost[c.post_id].push(c);
+    });
+
+    const result = posts.map(p => ({
+      ...p,
+      muted: mutedSet.has(p.username),
+      reactions: reactionsByPost[p.id] || [],
+      comments: commentsByPost[p.id] || []
+    }));
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create post
+app.post('/api/wall', async (req, res) => {
+  const { username, content } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  if(content.length > 280) return res.status(400).json({ error: 'Máximo 280 caracteres' });
+  try {
+    // Check if muted
+    const { rows } = await pool.query('SELECT muted FROM wall_strikes WHERE username=$1', [username]);
+    if(rows[0]?.muted) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+    const { rows: post } = await pool.query(
+      'INSERT INTO wall_posts (username, content) VALUES ($1, $2) RETURNING *',
+      [username, content.trim()]
+    );
+    res.json(post[0]);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete post (own or admin)
+app.delete('/api/wall/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username FROM wall_posts WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Post no encontrado' });
+    if(!is_admin && rows[0].username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    await pool.query('DELETE FROM wall_posts WHERE id=$1', [req.params.id]);
+
+    // If admin deleted, add strike to post owner
+    if(is_admin && rows[0].username !== username){
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE SET
+          strikes = wall_strikes.strikes + 1,
+          muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE FALSE END
+      `, [rows[0].username]);
+    }
+
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Toggle reaction
+app.post('/api/wall/:id/react', async (req, res) => {
+  const { username, emoji } = req.body;
+  if(!username || !emoji) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    // Check if already reacted with same emoji
+    const { rows } = await pool.query(
+      'SELECT id FROM wall_reactions WHERE post_id=$1 AND username=$2 AND emoji=$3',
+      [req.params.id, username, emoji]
+    );
+    if(rows.length){
+      await pool.query('DELETE FROM wall_reactions WHERE id=$1', [rows[0].id]);
+      res.json({ action: 'removed' });
+    } else {
+      await pool.query(
+        'INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1, $2, $3)',
+        [req.params.id, username, emoji]
+      );
+      res.json({ action: 'added' });
+    }
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Add comment
+app.post('/api/wall/:id/comment', async (req, res) => {
+  const { username, content, parent_id } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    const { rows } = await pool.query('SELECT muted FROM wall_strikes WHERE username=$1', [username]);
+    if(rows[0]?.muted) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+    const { rows: comment } = await pool.query(
+      'INSERT INTO wall_comments (post_id, parent_id, username, content) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.id, parent_id || null, username, content.trim()]
+    );
+    res.json(comment[0]);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete comment (own or admin)
+app.delete('/api/wall/comment/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
+    if(!is_admin && rows[0].username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+
+    // Strike if admin deleted someone else's comment
+    if(is_admin && rows[0].username !== username){
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE SET
+          strikes = wall_strikes.strikes + 1,
+          muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE FALSE END
+      `, [rows[0].username]);
+    }
+
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get user strike status
+app.get('/api/wall/strikes/:username', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT strikes, muted FROM wall_strikes WHERE username=$1', [req.params.username]);
+    res.json(rows[0] || { strikes: 0, muted: false });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: unmute user
+app.post('/api/wall/unmute', async (req, res) => {
+  const { username } = req.body;
+  try {
+    await pool.query('UPDATE wall_strikes SET muted=FALSE, strikes=0 WHERE username=$1', [username]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
 //  RANKING HISTORY
 // ══════════════════════════════════════════════════════
 
@@ -780,6 +1158,225 @@ app.get('/api/stats', async (req, res) => {
       goleador,
       aburrido
     });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  MURO
+// ══════════════════════════════════════════════════════
+const WALL_EMOJIS = ['⚽','🔥','😂','😬','👏','💀','🐐','😤'];
+
+// Get all posts with reactions and comment count
+app.get('/api/wall', async (req, res) => {
+  try {
+    const { rows: posts } = await pool.query(`
+      SELECT p.id, p.username, p.content, p.created_at,
+        COUNT(DISTINCT c.id) as comment_count
+      FROM wall_posts p
+      LEFT JOIN wall_comments c ON c.post_id = p.id
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+      LIMIT 100
+    `);
+
+    const { rows: reactions } = await pool.query(`
+      SELECT post_id, emoji, COUNT(*) as count, 
+        array_agg(username) as users
+      FROM wall_reactions
+      GROUP BY post_id, emoji
+    `);
+
+    // Group reactions by post
+    const reactionMap = {};
+    reactions.forEach(r => {
+      if(!reactionMap[r.post_id]) reactionMap[r.post_id] = {};
+      reactionMap[r.post_id][r.emoji] = { count: parseInt(r.count), users: r.users };
+    });
+
+    const result = posts.map(p => ({
+      ...p,
+      comment_count: parseInt(p.comment_count),
+      reactions: reactionMap[p.id] || {}
+    }));
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create post
+app.post('/api/wall', async (req, res) => {
+  const { username, content } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  if(content.length > 500) return res.status(400).json({ error: 'Máximo 500 caracteres' });
+  try {
+    // Check if user is muted
+    const { rows: muteCheck } = await pool.query(
+      'SELECT muted FROM wall_strikes WHERE username=$1 AND muted=TRUE', [username]
+    );
+    if(muteCheck.length) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+
+    const { rows } = await pool.query(
+      'INSERT INTO wall_posts (username, content) VALUES ($1, $2) RETURNING *',
+      [username, content.trim()]
+    );
+    res.json({ ...rows[0], reactions: {}, comment_count: 0 });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete post (own or admin)
+app.delete('/api/wall/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username FROM wall_posts WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Post no encontrado' });
+    if(rows[0].username !== username && !is_admin) return res.status(403).json({ error: 'Sin permiso' });
+
+    // If admin deleting someone else's post, add a strike
+    if(is_admin && rows[0].username !== username) {
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE 
+        SET strikes = wall_strikes.strikes + 1,
+            muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE wall_strikes.muted END
+      `, [rows[0].username]);
+    }
+
+    await pool.query('DELETE FROM wall_posts WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Toggle reaction
+app.post('/api/wall/:id/react', async (req, res) => {
+  const { username, emoji } = req.body;
+  if(!WALL_EMOJIS.includes(emoji)) return res.status(400).json({ error: 'Emoji inválido' });
+  try {
+    // Check if already reacted with this emoji
+    const { rows } = await pool.query(
+      'SELECT 1 FROM wall_reactions WHERE post_id=$1 AND username=$2',
+      [req.params.id, username]
+    );
+    if(rows.length) {
+      // Toggle — remove existing reaction
+      await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2', [req.params.id, username]);
+      // Add new one if different emoji
+      const { rows: existing } = await pool.query(
+        'SELECT emoji FROM wall_reactions WHERE post_id=$1 AND username=$2', [req.params.id, username]
+      );
+      if(!existing.length) {
+        // Was same emoji — just removed
+      }
+    }
+    // Insert new reaction
+    await pool.query(
+      'INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3) ON CONFLICT (post_id,username) DO UPDATE SET emoji=$3',
+      [req.params.id, username, emoji]
+    );
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Remove reaction
+app.delete('/api/wall/:id/react', async (req, res) => {
+  const { username } = req.body;
+  try {
+    await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2', [req.params.id, username]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get comments for a post
+app.get('/api/wall/:id/comments', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, post_id, parent_id, username, content, created_at
+      FROM wall_comments
+      WHERE post_id=$1
+      ORDER BY created_at ASC
+    `, [req.params.id]);
+    res.json(rows);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Add comment
+app.post('/api/wall/:id/comments', async (req, res) => {
+  const { username, content, parent_id } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  if(content.length > 300) return res.status(400).json({ error: 'Máximo 300 caracteres' });
+  try {
+    // Check if user is muted
+    const { rows: muteCheck } = await pool.query(
+      'SELECT muted FROM wall_strikes WHERE username=$1 AND muted=TRUE', [username]
+    );
+    if(muteCheck.length) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+
+    const { rows } = await pool.query(
+      'INSERT INTO wall_comments (post_id, parent_id, username, content) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.params.id, parent_id || null, username, content.trim()]
+    );
+    res.json(rows[0]);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete comment (own or admin)
+app.delete('/api/wall/comments/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
+    if(rows[0].username !== username && !is_admin) return res.status(403).json({ error: 'Sin permiso' });
+
+    // Strike if admin deleting someone else's comment
+    if(is_admin && rows[0].username !== username) {
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE
+        SET strikes = wall_strikes.strikes + 1,
+            muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE wall_strikes.muted END
+      `, [rows[0].username]);
+    }
+
+    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get strike status for a user
+app.get('/api/wall/strikes/:username', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT strikes, muted FROM wall_strikes WHERE username=$1', [req.params.username]);
+    res.json(rows[0] || { strikes: 0, muted: false });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Unmute a user (admin only)
+app.post('/api/wall/unmute/:username', async (req, res) => {
+  try {
+    await pool.query(`
+      INSERT INTO wall_strikes (username, strikes, muted) VALUES ($1, 0, FALSE)
+      ON CONFLICT (username) DO UPDATE SET muted=FALSE, strikes=0
+    `, [req.params.username]);
+    res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
