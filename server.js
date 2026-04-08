@@ -536,15 +536,19 @@ app.post('/api/wall/:id/react', async (req, res) => {
     );
     const prevEmoji = existing.rows[0]?.emoji;
     if(prevEmoji === emoji){
+      // Same emoji — toggle off
       await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2',
         [req.params.id, username]);
       res.json({ action: 'removed' });
+    } else if(prevEmoji){
+      // Different emoji — update
+      await pool.query('UPDATE wall_reactions SET emoji=$3 WHERE post_id=$1 AND username=$2',
+        [req.params.id, username, emoji]);
+      res.json({ action: 'updated' });
     } else {
-      await pool.query(
-        `INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3)
-         ON CONFLICT (post_id, username) DO UPDATE SET emoji=$3`,
-        [req.params.id, username, emoji]
-      );
+      // No existing reaction — insert
+      await pool.query('INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3)',
+        [req.params.id, username, emoji]);
       res.json({ action: 'added' });
     }
   } catch(e) { res.status(500).json({ error: e.message }); }
