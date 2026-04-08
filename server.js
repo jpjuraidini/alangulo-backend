@@ -60,7 +60,7 @@ async function initDB() {
       post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
       username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
       emoji TEXT NOT NULL,
-      PRIMARY KEY (post_id, username, emoji)
+      PRIMARY KEY (post_id, username)
     );
 
     CREATE TABLE IF NOT EXISTS wall_comments (
@@ -110,36 +110,6 @@ async function initDB() {
     );
 
     CREATE TABLE IF NOT EXISTS wall_reactions (
-      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
-      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-      emoji TEXT NOT NULL,
-      PRIMARY KEY (post_id, username)
-    );
-
-    CREATE TABLE IF NOT EXISTS wall_comments (
-      id SERIAL PRIMARY KEY,
-      post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
-      parent_id INT REFERENCES wall_comments(id) ON DELETE CASCADE,
-      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-      content TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS wall_strikes (
-      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-      strikes INT NOT NULL DEFAULT 0,
-      muted BOOLEAN DEFAULT FALSE,
-      PRIMARY KEY (username)
-    );
-
-    CREATE TABLE IF NOT EXISTS wall_posts (
-      id SERIAL PRIMARY KEY,
-      username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-      content TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS wall_reactions (
       id SERIAL PRIMARY KEY,
       post_id INT NOT NULL REFERENCES wall_posts(id) ON DELETE CASCADE,
       username TEXT NOT NULL,
@@ -167,6 +137,25 @@ async function initDB() {
     VALUES ('admin', '0000', TRUE, 'ADM')
     ON CONFLICT DO NOTHING;
   `);
+
+  // Migration: fix wall_reactions constraint to allow only 1 reaction per user per post
+  try {
+    await pool.query(`
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint 
+          WHERE conname = 'wall_reactions_pkey' 
+          AND pg_get_constraintdef(oid) LIKE '%(post_id, username, emoji)%'
+        ) THEN
+          ALTER TABLE wall_reactions DROP CONSTRAINT wall_reactions_pkey;
+          DELETE FROM wall_reactions a USING wall_reactions b
+            WHERE a.ctid < b.ctid AND a.post_id = b.post_id AND a.username = b.username;
+          ALTER TABLE wall_reactions ADD PRIMARY KEY (post_id, username);
+        END IF;
+      END $$;
+    `);
+  } catch(e) { console.log('Migration wall_reactions:', e.message); }
+
   console.log('✅ DB inicializada');
 }
 
@@ -541,20 +530,16 @@ app.post('/api/wall/:id/react', async (req, res) => {
   const { username, emoji } = req.body;
   if(!username||!emoji) return res.status(400).json({ error: 'Faltan datos' });
   try {
-    // Check if already reacted with this exact emoji → toggle off
     const existing = await pool.query(
       'SELECT emoji FROM wall_reactions WHERE post_id=$1 AND username=$2',
       [req.params.id, username]
     );
     const prevEmoji = existing.rows[0]?.emoji;
-
     if(prevEmoji === emoji){
-      // Same emoji — remove it
       await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2',
         [req.params.id, username]);
       res.json({ action: 'removed' });
     } else {
-      // Different emoji or no reaction — upsert
       await pool.query(
         `INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3)
          ON CONFLICT (post_id, username) DO UPDATE SET emoji=$3`,
@@ -797,6 +782,354 @@ app.delete('/api/groups/:id', async (req, res) => {
     res.json({ok:true});
   } catch(e) {
     res.status(500).json({error:e.message});
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  MURO — WALL
+// ══════════════════════════════════════════════════════
+
+// Get all posts with reactions and comments
+app.get('/api/wall', async (req, res) => {
+  try {
+    const { rows: posts } = await pool.query(
+      'SELECT id, username, content, created_at FROM wall_posts ORDER BY created_at DESC LIMIT 50'
+    );
+    if(!posts.length) return res.json([]);
+
+    const postIds = posts.map(p => p.id);
+
+    const [reactRows, commentRows, strikeRows] = await Promise.all([
+      pool.query('SELECT post_id, username, emoji FROM wall_reactions WHERE post_id = ANY($1)', [postIds]),
+      pool.query('SELECT id, post_id, parent_id, username, content, created_at FROM wall_comments WHERE post_id = ANY($1) ORDER BY created_at ASC', [postIds]),
+      pool.query('SELECT username, muted FROM wall_strikes')
+    ]);
+
+    const mutedSet = new Set(strikeRows.rows.filter(r=>r.muted).map(r=>r.username));
+
+    // Group reactions by post
+    const reactionsByPost = {};
+    reactRows.rows.forEach(r => {
+      if(!reactionsByPost[r.post_id]) reactionsByPost[r.post_id] = [];
+      reactionsByPost[r.post_id].push({ username: r.username, emoji: r.emoji });
+    });
+
+    // Group comments by post
+    const commentsByPost = {};
+    commentRows.rows.forEach(c => {
+      if(!commentsByPost[c.post_id]) commentsByPost[c.post_id] = [];
+      commentsByPost[c.post_id].push(c);
+    });
+
+    const result = posts.map(p => ({
+      ...p,
+      muted: mutedSet.has(p.username),
+      reactions: reactionsByPost[p.id] || [],
+      comments: commentsByPost[p.id] || []
+    }));
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create post
+app.post('/api/wall', async (req, res) => {
+  const { username, content } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  if(content.length > 280) return res.status(400).json({ error: 'Máximo 280 caracteres' });
+  try {
+    // Check if muted
+    const { rows } = await pool.query('SELECT muted FROM wall_strikes WHERE username=$1', [username]);
+    if(rows[0]?.muted) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+    const { rows: post } = await pool.query(
+      'INSERT INTO wall_posts (username, content) VALUES ($1, $2) RETURNING *',
+      [username, content.trim()]
+    );
+    res.json(post[0]);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete post (own or admin)
+app.delete('/api/wall/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username FROM wall_posts WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Post no encontrado' });
+    if(!is_admin && rows[0].username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    await pool.query('DELETE FROM wall_posts WHERE id=$1', [req.params.id]);
+
+    // If admin deleted, add strike to post owner
+    if(is_admin && rows[0].username !== username){
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE SET
+          strikes = wall_strikes.strikes + 1,
+          muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE FALSE END
+      `, [rows[0].username]);
+    }
+
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+
+// Add comment
+app.post('/api/wall/:id/comment', async (req, res) => {
+  const { username, content, parent_id } = req.body;
+  if(!username || !content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
+  try {
+    const { rows } = await pool.query('SELECT muted FROM wall_strikes WHERE username=$1', [username]);
+    if(rows[0]?.muted) return res.status(403).json({ error: 'Tu acceso al muro está desactivado' });
+    const { rows: comment } = await pool.query(
+      'INSERT INTO wall_comments (post_id, parent_id, username, content) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.id, parent_id || null, username, content.trim()]
+    );
+    res.json(comment[0]);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete comment (own or admin)
+app.delete('/api/wall/comment/:id', async (req, res) => {
+  const { username, is_admin } = req.body;
+  try {
+    const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1', [req.params.id]);
+    if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
+    if(!is_admin && rows[0].username !== username) return res.status(403).json({ error: 'Sin permiso' });
+
+    await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+
+    // Strike if admin deleted someone else's comment
+    if(is_admin && rows[0].username !== username){
+      await pool.query(`
+        INSERT INTO wall_strikes (username, strikes) VALUES ($1, 1)
+        ON CONFLICT (username) DO UPDATE SET
+          strikes = wall_strikes.strikes + 1,
+          muted = CASE WHEN wall_strikes.strikes + 1 >= 2 THEN TRUE ELSE FALSE END
+      `, [rows[0].username]);
+    }
+
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get user strike status
+app.get('/api/wall/strikes/:username', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT strikes, muted FROM wall_strikes WHERE username=$1', [req.params.username]);
+    res.json(rows[0] || { strikes: 0, muted: false });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: unmute user
+app.post('/api/wall/unmute', async (req, res) => {
+  const { username } = req.body;
+  try {
+    await pool.query('UPDATE wall_strikes SET muted=FALSE, strikes=0 WHERE username=$1', [username]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  RANKING HISTORY
+// ══════════════════════════════════════════════════════
+
+// Guardar snapshot del ranking (lo llama el admin)
+app.post('/api/ranking/snapshot', async (req, res) => {
+  const { label } = req.body;
+  if(!label) return res.status(400).json({ error: 'Se requiere un label' });
+  try {
+    const board = await buildRanking();
+    await pool.query(
+      'INSERT INTO ranking_history (snapshot, label) VALUES ($1, $2)',
+      [JSON.stringify(board), label]
+    );
+    res.json({ ok: true, count: board.length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Obtener todos los snapshots
+app.get('/api/ranking/history', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, label, created_at, snapshot FROM ranking_history ORDER BY created_at ASC'
+    );
+    res.json(rows);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Eliminar un snapshot
+app.delete('/api/ranking/snapshot/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM ranking_history WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  ESTADÍSTICAS GLOBALES
+// ══════════════════════════════════════════════════════
+app.get('/api/stats', async (req, res) => {
+  try {
+    const [picksRows, resultsRow, usersRow] = await Promise.all([
+      pool.query('SELECT username, data FROM picks'),
+      pool.query('SELECT data FROM results WHERE id = 1'),
+      pool.query('SELECT username, is_admin FROM users')
+    ]);
+
+    const results = resultsRow.rows[0]?.data || {};
+    const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+    const allPicks = picksRows.rows.filter(r => !admins.has(r.username));
+    const total = allPicks.length;
+    if(!total) return res.json({ empty: true });
+
+    const rSC = results.sc || {};
+    const rBR = results.bracket || {};
+
+    // 1. Aciertos y exactos por partido de grupos
+    const matchStats = {};
+    Object.entries(rSC).forEach(([id, rr]) => {
+      if(rr?.h==null || rr?.a==null) return;
+      const rRes = rr.h>rr.a?'h':rr.h<rr.a?'a':'e';
+      let correct=0, exact=0, picked=0;
+      allPicks.forEach(p => {
+        const ms = p.data?.sc?.[id];
+        if(!ms) return;
+        picked++;
+        const mRes = +ms.h>+ms.a?'h':+ms.h<+ms.a?'a':'e';
+        if(mRes===rRes) correct++;
+        if(+ms.h===rr.h && +ms.a===rr.a) exact++;
+      });
+      if(picked>0) matchStats[id] = { correct, exact, picked, pct: Math.round(correct/picked*100) };
+    });
+
+    // 2. Partido más acertado y más exacto
+    const sortedByPct = Object.entries(matchStats).sort((a,b)=>b[1].pct-a[1].pct);
+    const sortedByExact = Object.entries(matchStats).sort((a,b)=>b[1].exact-a[1].exact);
+    const mostCorrect = sortedByPct[0] ? { id: sortedByPct[0][0], ...sortedByPct[0][1] } : null;
+    const mostExact = sortedByExact[0] ? { id: sortedByExact[0][0], ...sortedByExact[0][1] } : null;
+    const leastCorrect = sortedByPct.length ? { id: sortedByPct[sortedByPct.length-1][0], ...sortedByPct[sortedByPct.length-1][1] } : null;
+
+    // 3. Equipo más votado como campeón (último partido del bracket)
+    const champVotes = {};
+    allPicks.forEach(p => {
+      const br = p.data?.br || {};
+      const keys = Object.keys(br);
+      // Find the pick with highest match number (the final)
+      const finalKey = keys.sort().reverse()[0];
+      if(finalKey && br[finalKey]){
+        const team = br[finalKey];
+        champVotes[team] = (champVotes[team]||0) + 1;
+      }
+    });
+    const topChamp = Object.entries(champVotes).sort((a,b)=>b[1]-a[1]).slice(0,3)
+      .map(([team, votes]) => ({ team, votes, pct: Math.round(votes/total*100) }));
+
+    // 4. Exactos en grupos por usuario
+    const exactByUser = allPicks.map(p => {
+      let ex=0;
+      Object.entries(rSC).forEach(([id,rr]) => {
+        if(rr?.h==null||rr?.a==null) return;
+        const ms = p.data?.sc?.[id];
+        if(ms && +ms.h===rr.h && +ms.a===rr.a) ex++;
+      });
+      return { name: p.username, exact: ex };
+    }).sort((a,b)=>b.exact-a.exact).filter(u=>u.exact>0).slice(0,5);
+
+    // 5. % acierto global en grupos
+    let totalCorrect=0, totalPossible=0;
+    allPicks.forEach(p => {
+      Object.entries(rSC).forEach(([id,rr]) => {
+        if(rr?.h==null||rr?.a==null) return;
+        const ms = p.data?.sc?.[id];
+        if(!ms) return;
+        totalPossible++;
+        const rRes = rr.h>rr.a?'h':rr.h<rr.a?'a':'e';
+        const mRes = +ms.h>+ms.a?'h':+ms.h<+ms.a?'a':'e';
+        if(mRes===rRes) totalCorrect++;
+      });
+    });
+    const globalPct = totalPossible>0 ? Math.round(totalCorrect/totalPossible*100) : 0;
+
+    // 6. Partidos jugados con resultados
+    const matchesWithResults = Object.keys(rSC).filter(id => rSC[id]?.h!=null).length;
+    const bracketWithResults = Object.keys(rBR).filter(id => rBR[id]?.winner).length;
+
+    // 7. La Tumba — bracket completo, menos puntos
+    const BRACKET_MATCH_IDS = ['r32','r16','qf','sf','f'];
+    function hasBracketComplete(picksData){
+      const br = picksData?.br || {};
+      return Object.keys(br).length >= 31; // 32 partidos eliminatorios
+    }
+    const withBracket = allPicks.filter(p => hasBracketComplete(p.data));
+    let tumba = null;
+    if(withBracket.length){
+      const ranked = withBracket.map(p=>({name:p.username,...calcScoreServer(p.data,results)}))
+        .sort((a,b)=>a.total-b.total);
+      tumba = ranked[0];
+    }
+
+    // 8. El Básico — quien más veces puso 2-0
+    const basicoCounts = allPicks.map(p=>{
+      let count=0;
+      Object.values(p.data?.sc||{}).forEach(ms=>{
+        if(+ms.h===2 && +ms.a===0) count++;
+      });
+      return { name: p.username, count };
+    }).sort((a,b)=>b.count-a.count).filter(u=>u.count>0);
+    const basico = basicoCounts[0] || null;
+
+    // 9. El más goleador — quien predijo más goles en total
+    const goleadorCounts = allPicks.map(p=>{
+      let goals=0;
+      Object.values(p.data?.sc||{}).forEach(ms=>{
+        goals += (+ms.h||0) + (+ms.a||0);
+      });
+      return { name: p.username, goals };
+    }).sort((a,b)=>b.goals-a.goals);
+    const goleador = goleadorCounts[0] || null;
+
+    // 10. El Aburrido — quien predijo menos goles en total
+    const aburrido = goleadorCounts.length ? goleadorCounts[goleadorCounts.length-1] : null;
+
+    res.json({
+      total,
+      matchesWithResults,
+      bracketWithResults,
+      globalPct,
+      mostCorrect,
+      mostExact,
+      leastCorrect,
+      topChamp,
+      exactByUser,
+      tumba,
+      basico,
+      goleador,
+      aburrido
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
