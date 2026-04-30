@@ -1102,9 +1102,23 @@ app.get('/api/stats', async (req, res) => {
 
     const results = resultsRow.rows[0]?.data || {};
     const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
-    const allPicks = picksRows.rows.filter(r => !admins.has(r.username));
+    const allPicksRaw = picksRows.rows.filter(r => !admins.has(r.username));
+    const totalRegistered = allPicksRaw.length;
+
+    // ── Filtro: SOLO usuarios con bracket completo aparecen en stats ──
+    function hasBracketComplete(picksData){
+      const br = picksData?.br || {};
+      return Object.keys(br).length >= 31;
+    }
+    const allPicks = allPicksRaw.filter(p => hasBracketComplete(p.data));
     const total = allPicks.length;
-    if(!total) return res.json({ empty: true });
+
+    if(!total) return res.json({
+      empty: true,
+      totalRegistered,
+      eligibleCount: 0,
+      message: 'Sin jugadores con bracket completo todavía'
+    });
 
     const rSC = results.sc || {};
     const rBR = results.bracket || {};
@@ -1178,16 +1192,10 @@ app.get('/api/stats', async (req, res) => {
     const matchesWithResults = Object.keys(rSC).filter(id => rSC[id]?.h!=null).length;
     const bracketWithResults = Object.keys(rBR).filter(id => rBR[id]?.winner).length;
 
-    // 7. La Tumba — bracket completo, menos puntos
-    const BRACKET_MATCH_IDS = ['r32','r16','qf','sf','f'];
-    function hasBracketComplete(picksData){
-      const br = picksData?.br || {};
-      return Object.keys(br).length >= 31; // 32 partidos eliminatorios
-    }
-    const withBracket = allPicks.filter(p => hasBracketComplete(p.data));
+    // 7. La Tumba — el de menos puntos (todos ya tienen bracket completo por el filtro inicial)
     let tumba = null;
-    if(withBracket.length){
-      const ranked = withBracket.map(p=>({name:p.username,...calcScoreServer(p.data,results)}))
+    if(allPicks.length){
+      const ranked = allPicks.map(p=>({name:p.username,...calcScoreServer(p.data,results)}))
         .sort((a,b)=>a.total-b.total);
       tumba = ranked[0];
     }
@@ -1217,6 +1225,8 @@ app.get('/api/stats', async (req, res) => {
 
     res.json({
       total,
+      totalRegistered,
+      eligibleCount: total,
       matchesWithResults,
       bracketWithResults,
       globalPct,
