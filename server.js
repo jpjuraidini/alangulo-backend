@@ -156,6 +156,21 @@ async function initDB() {
     `);
   } catch(e) { console.log('Migration wall_reactions:', e.message); }
 
+  // Migration: approval flow — add approved/phone/full_name to users
+  try {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+    `);
+    // Auto-approve users that existed before this migration (created more than 1 min ago) and all admins
+    await pool.query(`
+      UPDATE users SET approved = TRUE
+      WHERE approved IS NOT TRUE
+        AND (is_admin = TRUE OR created_at < NOW() - INTERVAL '1 minute')
+    `);
+  } catch(e) { console.log('Migration approval flow:', e.message); }
+
   console.log('✅ DB inicializada');
 }
 
@@ -174,6 +189,13 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Usuario o PIN incorrecto' });
     }
     const user = rows[0];
+
+    // Bloquear si la cuenta no ha sido aprobada por un admin
+    if (user.approved === false) {
+      return res.status(403).json({
+        error: 'pending_approval: Tu cuenta está esperando aprobación del organizador. Te avisaremos en cuanto te demos acceso.'
+      });
+    }
 
     // Registrar referido si viene con código
     if (refCode && refCode.length === 3) {
@@ -212,7 +234,7 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT username, is_admin, code FROM users ORDER BY created_at'
+      'SELECT username, is_admin, code, approved, phone, full_name, created_at FROM users ORDER BY created_at'
     );
     res.json(rows);
   } catch (e) {
@@ -220,12 +242,12 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Crear usuario
+// Crear usuario (admin) — se crea ya aprobado
 app.post('/api/users', async (req, res) => {
   const { username, pin, code } = req.body;
   try {
     await pool.query(
-      'INSERT INTO users (username, pin, is_admin, code) VALUES ($1, $2, FALSE, $3)',
+      'INSERT INTO users (username, pin, is_admin, code, approved) VALUES ($1, $2, FALSE, $3, TRUE)',
       [username.toLowerCase(), pin, code.toUpperCase()]
     );
     await pool.query(
@@ -235,6 +257,82 @@ app.post('/api/users', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Usuario o código ya existe' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Inscripción pública — crea usuario en estado "pending approval"
+app.post('/api/signup', async (req, res) => {
+  let { full_name, phone, username, pin } = req.body || {};
+  if (!full_name || !phone || !username || !pin) {
+    return res.status(400).json({ error: 'Faltan campos requeridos' });
+  }
+  full_name = String(full_name).trim().slice(0, 80);
+  phone = String(phone).trim().slice(0, 20);
+  username = String(username).toLowerCase().trim().slice(0, 30);
+  pin = String(pin).trim();
+  if (!/^[a-z0-9_]{3,30}$/.test(username)) {
+    return res.status(400).json({ error: 'Usuario inválido (3-30 caracteres, solo letras, números y _)' });
+  }
+  if (!/^\d{4,6}$/.test(pin)) {
+    return res.status(400).json({ error: 'PIN debe tener entre 4 y 6 dígitos' });
+  }
+  if (full_name.length < 2) {
+    return res.status(400).json({ error: 'Nombre demasiado corto' });
+  }
+  // Generar código único de 3 caracteres
+  const genCode = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    return Array.from({length:3}, ()=>chars[Math.floor(Math.random()*chars.length)]).join('');
+  };
+  try {
+    let code, attempts = 0;
+    while (attempts < 10) {
+      code = genCode();
+      const exists = await pool.query('SELECT 1 FROM users WHERE code = $1', [code]);
+      if (!exists.rows.length) break;
+      attempts++;
+    }
+    await pool.query(
+      `INSERT INTO users (username, pin, is_admin, code, approved, phone, full_name)
+       VALUES ($1, $2, FALSE, $3, FALSE, $4, $5)`,
+      [username, pin, code, phone, full_name]
+    );
+    await pool.query(
+      'INSERT INTO picks (username) VALUES ($1) ON CONFLICT DO NOTHING', [username]
+    );
+    res.json({ ok: true, username, status: 'pending_approval' });
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ese usuario ya existe' });
+    console.error('signup error:', e);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+// Aprobar inscripción (admin)
+app.post('/api/users/:username/approve', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE users SET approved = TRUE WHERE username = $1 RETURNING username',
+      [req.params.username.toLowerCase()]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Rechazar inscripción (admin) — borra al usuario pendiente
+app.post('/api/users/:username/reject', async (req, res) => {
+  try {
+    // Solo permitir borrar usuarios no aprobados y no admin
+    await pool.query(
+      'DELETE FROM users WHERE username = $1 AND is_admin = FALSE AND approved = FALSE',
+      [req.params.username.toLowerCase()]
+    );
+    res.json({ ok: true });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
@@ -364,12 +462,13 @@ async function buildRanking() {
   const [picksRows, resultsRow, usersRow] = await Promise.all([
     pool.query('SELECT username, data FROM picks'),
     pool.query('SELECT data FROM results WHERE id = 1'),
-    pool.query('SELECT username, is_admin FROM users')
+    pool.query('SELECT username, is_admin, approved FROM users')
   ]);
   const results = resultsRow.rows[0]?.data || {};
   const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+  const approvedSet = new Set(usersRow.rows.filter(u => u.approved !== false).map(u => u.username));
   const board = picksRows.rows
-    .filter(r => !admins.has(r.username))
+    .filter(r => !admins.has(r.username) && approvedSet.has(r.username))
     .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
     .sort((a, b) => b.total - a.total);
   _rankingCache = board;
