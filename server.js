@@ -454,7 +454,7 @@ app.get('/api/picks', async (req, res) => {
 
 const PTS_SERVER = {
   grpResult: 1, grpExact: 2,
-  r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], f:[10,20]
+  r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], tp:[10,20], f:[10,20]
 };
 
 function calcScoreServer(picksData, results) {
@@ -1057,7 +1057,7 @@ app.get('/api/stats', async (req, res) => {
     // ── Filtro: SOLO usuarios con bracket completo aparecen en stats ──
     function hasBracketComplete(picksData){
       const br = picksData?.br || {};
-      return Object.keys(br).length >= 31;
+      return Object.keys(br).length >= 32;
     }
     const allPicks = allPicksRaw.filter(p => hasBracketComplete(p.data));
     const total = allPicks.length;
