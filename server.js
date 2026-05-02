@@ -162,12 +162,19 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_pro BOOLEAN DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS requested_type TEXT DEFAULT 'pro';
     `);
     // Auto-approve users that existed before this migration (created more than 1 min ago) and all admins
     await pool.query(`
       UPDATE users SET approved = TRUE
       WHERE approved IS NOT TRUE
         AND (is_admin = TRUE OR created_at < NOW() - INTERVAL '1 minute')
+    `);
+    // Migrar todos los users existentes a Pro (todos pagaron $350)
+    await pool.query(`
+      UPDATE users SET is_pro = TRUE
+      WHERE is_pro IS NULL
     `);
   } catch(e) { console.log('Migration approval flow:', e.message); }
 
@@ -218,6 +225,7 @@ app.post('/api/login', async (req, res) => {
     res.json({
       username: user.username,
       is_admin: user.is_admin,
+      is_pro: user.is_pro !== false,
       code: user.code
     });
   } catch (e) {
@@ -234,7 +242,7 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT username, is_admin, code, approved, phone, full_name, created_at FROM users ORDER BY created_at'
+      'SELECT username, is_admin, code, approved, phone, full_name, created_at, is_pro, requested_type FROM users ORDER BY created_at'
     );
     res.json(rows);
   } catch (e) {
@@ -263,7 +271,7 @@ app.post('/api/users', async (req, res) => {
 
 // Inscripción pública — crea usuario en estado "pending approval"
 app.post('/api/signup', async (req, res) => {
-  let { full_name, phone, username, pin } = req.body || {};
+  let { full_name, phone, username, pin, requested_type } = req.body || {};
   if (!full_name || !phone || !username || !pin) {
     return res.status(400).json({ error: 'Faltan campos requeridos' });
   }
@@ -271,6 +279,9 @@ app.post('/api/signup', async (req, res) => {
   phone = String(phone).trim().slice(0, 20);
   username = String(username).toLowerCase().trim().slice(0, 30);
   pin = String(pin).trim();
+  // Validar tipo solicitado: 'pro' o 'user'
+  requested_type = String(requested_type || 'pro').toLowerCase();
+  if (!['pro', 'user'].includes(requested_type)) requested_type = 'pro';
   if (!/^[a-z0-9_]{3,30}$/.test(username)) {
     return res.status(400).json({ error: 'Usuario inválido (3-30 caracteres, solo letras, números y _)' });
   }
@@ -294,9 +305,9 @@ app.post('/api/signup', async (req, res) => {
       attempts++;
     }
     await pool.query(
-      `INSERT INTO users (username, pin, is_admin, code, approved, phone, full_name)
-       VALUES ($1, $2, FALSE, $3, FALSE, $4, $5)`,
-      [username, pin, code, phone, full_name]
+      `INSERT INTO users (username, pin, is_admin, code, approved, phone, full_name, requested_type, is_pro)
+       VALUES ($1, $2, FALSE, $3, FALSE, $4, $5, $6, FALSE)`,
+      [username, pin, code, phone, full_name, requested_type]
     );
     await pool.query(
       'INSERT INTO picks (username) VALUES ($1) ON CONFLICT DO NOTHING', [username]
@@ -312,11 +323,37 @@ app.post('/api/signup', async (req, res) => {
 // Aprobar inscripción (admin)
 app.post('/api/users/:username/approve', async (req, res) => {
   try {
+    const { is_pro } = req.body || {};
+    // Si no se especifica is_pro, se infiere del requested_type
+    let proValue = is_pro;
+    if (typeof proValue === 'undefined') {
+      const u = await pool.query('SELECT requested_type FROM users WHERE username = $1', [req.params.username.toLowerCase()]);
+      proValue = u.rows[0]?.requested_type === 'pro';
+    }
     const result = await pool.query(
-      'UPDATE users SET approved = TRUE WHERE username = $1 RETURNING username',
-      [req.params.username.toLowerCase()]
+      'UPDATE users SET approved = TRUE, is_pro = $2 WHERE username = $1 RETURNING username, is_pro',
+      [req.params.username.toLowerCase(), !!proValue]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json({ ok: true, is_pro: result.rows[0].is_pro });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Upgrade User → Pro (admin marca como pagado)
+app.post('/api/users/:username/upgrade-pro', async (req, res) => {
+  try {
+    // Bloqueo: no se puede upgrade después del 11 jun 2026 1pm CDMX (UTC-6 → 19:00 UTC)
+    const cutoff = new Date('2026-06-11T19:00:00Z');
+    if (new Date() >= cutoff) {
+      return res.status(403).json({ error: 'El upgrade a Pro no está disponible una vez iniciado el torneo' });
+    }
+    const result = await pool.query(
+      'UPDATE users SET is_pro = TRUE WHERE username = $1 AND approved = TRUE RETURNING username',
+      [req.params.username.toLowerCase()]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado o no aprobado' });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -462,18 +499,36 @@ async function buildRanking() {
   const [picksRows, resultsRow, usersRow] = await Promise.all([
     pool.query('SELECT username, data FROM picks'),
     pool.query('SELECT data FROM results WHERE id = 1'),
-    pool.query('SELECT username, is_admin, approved FROM users')
+    pool.query('SELECT username, is_admin, approved, is_pro FROM users')
   ]);
   const results = resultsRow.rows[0]?.data || {};
   const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
   const approvedSet = new Set(usersRow.rows.filter(u => u.approved !== false).map(u => u.username));
+  const proSet = new Set(usersRow.rows.filter(u => u.is_pro !== false).map(u => u.username));
   const board = picksRows.rows
-    .filter(r => !admins.has(r.username) && approvedSet.has(r.username))
+    .filter(r => !admins.has(r.username) && approvedSet.has(r.username) && proSet.has(r.username))
     .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
     .sort((a, b) => b.total - a.total);
   _rankingCache = board;
   _rankingCacheAt = Date.now();
   return board;
+}
+
+// Ranking simulado para Users (incluye TODOS los aprobados, Pros + Users)
+// Sirve para mostrar "si fueras Pro estarías en el lugar #X"
+async function buildSimulatedRanking() {
+  const [picksRows, resultsRow, usersRow] = await Promise.all([
+    pool.query('SELECT username, data FROM picks'),
+    pool.query('SELECT data FROM results WHERE id = 1'),
+    pool.query('SELECT username, is_admin, approved FROM users')
+  ]);
+  const results = resultsRow.rows[0]?.data || {};
+  const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
+  const approvedSet = new Set(usersRow.rows.filter(u => u.approved !== false).map(u => u.username));
+  return picksRows.rows
+    .filter(r => !admins.has(r.username) && approvedSet.has(r.username))
+    .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
+    .sort((a, b) => b.total - a.total);
 }
 
 function invalidateRankingCache() {
@@ -488,6 +543,17 @@ app.get('/api/ranking', async (req, res) => {
       return res.json(_rankingCache);
     }
     const board = await buildRanking();
+    res.json(board);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ranking simulado (incluye Users + Pros) para mostrar a Users
+// "Si fueras Pro, estarías en el lugar #X"
+app.get('/api/ranking/simulated', async (req, res) => {
+  try {
+    const board = await buildSimulatedRanking();
     res.json(board);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1097,12 +1163,14 @@ app.get('/api/stats', async (req, res) => {
     const [picksRows, resultsRow, usersRow] = await Promise.all([
       pool.query('SELECT username, data FROM picks'),
       pool.query('SELECT data FROM results WHERE id = 1'),
-      pool.query('SELECT username, is_admin FROM users')
+      pool.query('SELECT username, is_admin, is_pro FROM users')
     ]);
 
     const results = resultsRow.rows[0]?.data || {};
     const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
-    const allPicksRaw = picksRows.rows.filter(r => !admins.has(r.username));
+    const proSet = new Set(usersRow.rows.filter(u => u.is_pro !== false).map(u => u.username));
+    // Solo Pros entran a stats globales (Users no participan en bolsa ni stats globales)
+    const allPicksRaw = picksRows.rows.filter(r => !admins.has(r.username) && proSet.has(r.username));
     const totalRegistered = allPicksRaw.length;
 
     // ── Filtro: SOLO usuarios con bracket completo aparecen en stats ──
