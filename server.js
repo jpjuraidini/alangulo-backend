@@ -707,9 +707,22 @@ app.post('/api/refs_register', async (req, res) => {
 //  MURO
 // ══════════════════════════════════════════════════════
 
+// Cache muy corto del muro (300ms) — protege contra polling agresivo (500ms en frontend)
+// Si 50 usuarios hacen polling simultáneo, máximo 1 query a Postgres cada 300ms
+let _wallCache = null;
+let _wallCacheAt = 0;
+const WALL_CACHE_TTL = 300;
+function invalidateWallCache(){ _wallCache = null; _wallCacheAt = 0; }
+
 // Get all posts with reactions and comment counts
 app.get('/api/wall', async (req, res) => {
   try {
+    // Servir desde cache si es reciente
+    const now = Date.now();
+    if(_wallCache && (now - _wallCacheAt) < WALL_CACHE_TTL){
+      return res.json(_wallCache);
+    }
+
     const { rows: posts } = await pool.query(`
       SELECT p.id, p.username, p.content, p.deleted, p.muted, p.created_at,
              COUNT(DISTINCT c.id) FILTER (WHERE c.deleted=FALSE AND c.parent_id IS NULL) as comment_count
@@ -734,7 +747,10 @@ app.get('/api/wall', async (req, res) => {
       reactionMap[r.post_id].push({ emoji: r.emoji, count: parseInt(r.count), users: r.users });
     });
 
-    res.json(posts.map(p => ({ ...p, reactions: reactionMap[p.id] || [] })));
+    const result = posts.map(p => ({ ...p, reactions: reactionMap[p.id] || [] }));
+    _wallCache = result;
+    _wallCacheAt = now;
+    res.json(result);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -750,6 +766,7 @@ app.post('/api/wall', async (req, res) => {
       'INSERT INTO wall_posts (username, content) VALUES ($1, $2) RETURNING *',
       [username, content.trim().slice(0,500)]
     );
+    invalidateWallCache();
     res.json(post[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -773,9 +790,11 @@ app.delete('/api/wall/:id', async (req, res) => {
         // Mute all posts from this user
         await pool.query('UPDATE wall_posts SET muted=TRUE WHERE username=$1', [post.username]);
       }
+      invalidateWallCache();
       res.json({ ok: true, muted, deleteCount: newCount });
     } else {
       await pool.query('UPDATE wall_posts SET deleted=TRUE WHERE id=$1 AND username=$2', [req.params.id, username]);
+      invalidateWallCache();
       res.json({ ok: true });
     }
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -795,16 +814,19 @@ app.post('/api/wall/:id/react', async (req, res) => {
       // Same emoji — toggle off
       await pool.query('DELETE FROM wall_reactions WHERE post_id=$1 AND username=$2',
         [req.params.id, username]);
+      invalidateWallCache();
       res.json({ action: 'removed' });
     } else if(prevEmoji){
       // Different emoji — update
       await pool.query('UPDATE wall_reactions SET emoji=$3 WHERE post_id=$1 AND username=$2',
         [req.params.id, username, emoji]);
+      invalidateWallCache();
       res.json({ action: 'updated' });
     } else {
       // No existing reaction — insert
       await pool.query('INSERT INTO wall_reactions (post_id, username, emoji) VALUES ($1,$2,$3)',
         [req.params.id, username, emoji]);
+      invalidateWallCache();
       res.json({ action: 'added' });
     }
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -832,6 +854,7 @@ app.post('/api/wall/:id/comments', async (req, res) => {
       'INSERT INTO wall_comments (post_id, parent_id, username, content) VALUES ($1,$2,$3,$4) RETURNING *',
       [req.params.id, parent_id||null, username, content.trim().slice(0,500)]
     );
+    invalidateWallCache();
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -865,6 +888,7 @@ async function deleteCommentHandler(req, res){
       `, [comment.username]);
     }
     await pool.query('DELETE FROM wall_comments WHERE id=$1', [req.params.id]);
+    invalidateWallCache();
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 }
