@@ -713,6 +713,11 @@ function invalidateWallCache(){ /* no-op por ahora */ }
 
 // Get all posts with reactions and comment counts
 app.get('/api/wall', async (req, res) => {
+  // Anti-cache headers — garantiza que el polling siempre reciba datos frescos,
+  // no respuestas 304 ni cache de proxies/browser
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   try {
     const { rows: posts } = await pool.query(`
       SELECT p.id, p.username, p.content, p.deleted, p.muted, p.created_at,
