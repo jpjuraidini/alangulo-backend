@@ -345,6 +345,7 @@ app.post('/api/users/:username/approve', async (req, res) => {
       [req.params.username.toLowerCase(), !!proValue]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    invalidateRankingCache();
     res.json({ ok: true, is_pro: result.rows[0].is_pro });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -364,6 +365,7 @@ app.post('/api/users/:username/upgrade-pro', async (req, res) => {
       [req.params.username.toLowerCase()]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado o no aprobado' });
+    invalidateRankingCache();
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -378,6 +380,7 @@ app.post('/api/users/:username/reject', async (req, res) => {
       'DELETE FROM users WHERE username = $1 AND is_admin = FALSE AND approved = FALSE',
       [req.params.username.toLowerCase()]
     );
+    invalidateRankingCache();
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -389,6 +392,7 @@ app.delete('/api/users/:username', async (req, res) => {
   try {
     await pool.query('DELETE FROM users WHERE username = $1 AND is_admin = FALSE',
       [req.params.username]);
+    invalidateRankingCache();
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -583,12 +587,16 @@ async function buildRanking() {
     pool.query('SELECT username, is_admin, approved, is_pro FROM users')
   ]);
   const results = resultsRow.rows[0]?.data || {};
-  const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
-  const approvedSet = new Set(usersRow.rows.filter(u => u.approved !== false).map(u => u.username));
-  const proSet = new Set(usersRow.rows.filter(u => u.is_pro !== false).map(u => u.username));
-  const board = picksRows.rows
-    .filter(r => !admins.has(r.username) && approvedSet.has(r.username) && proSet.has(r.username))
-    .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
+  // Mapa de picks por username (vacío si no tiene)
+  const picksMap = new Map(picksRows.rows.map(r => [r.username, r.data]));
+  // Iterar sobre USUARIOS aprobados Pros (no sobre picks) — así aparecen incluso quienes
+  // no han hecho predicciones aún
+  const board = usersRow.rows
+    .filter(u => u.is_admin !== true && u.approved !== false && u.is_pro !== false)
+    .map(u => ({
+      name: u.username,
+      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results)
+    }))
     .sort((a, b) => b.total - a.total);
   _rankingCache = board;
   _rankingCacheAt = Date.now();
@@ -604,11 +612,13 @@ async function buildSimulatedRanking() {
     pool.query('SELECT username, is_admin, approved FROM users')
   ]);
   const results = resultsRow.rows[0]?.data || {};
-  const admins = new Set(usersRow.rows.filter(u => u.is_admin).map(u => u.username));
-  const approvedSet = new Set(usersRow.rows.filter(u => u.approved !== false).map(u => u.username));
-  return picksRows.rows
-    .filter(r => !admins.has(r.username) && approvedSet.has(r.username))
-    .map(r => ({ name: r.username, ...calcScoreServer(r.data, results) }))
+  const picksMap = new Map(picksRows.rows.map(r => [r.username, r.data]));
+  return usersRow.rows
+    .filter(u => u.is_admin !== true && u.approved !== false)
+    .map(u => ({
+      name: u.username,
+      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results)
+    }))
     .sort((a, b) => b.total - a.total);
 }
 
