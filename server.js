@@ -707,22 +707,13 @@ app.post('/api/refs_register', async (req, res) => {
 //  MURO
 // ══════════════════════════════════════════════════════
 
-// Cache muy corto del muro (300ms) — protege contra polling agresivo (500ms en frontend)
-// Si 50 usuarios hacen polling simultáneo, máximo 1 query a Postgres cada 300ms
-let _wallCache = null;
-let _wallCacheAt = 0;
-const WALL_CACHE_TTL = 300;
-function invalidateWallCache(){ _wallCache = null; _wallCacheAt = 0; }
+// El muro NO usa cache para garantizar que cada poll devuelva datos frescos.
+// Si el polling crea carga, ajustar el TTL aquí más adelante.
+function invalidateWallCache(){ /* no-op por ahora */ }
 
 // Get all posts with reactions and comment counts
 app.get('/api/wall', async (req, res) => {
   try {
-    // Servir desde cache si es reciente
-    const now = Date.now();
-    if(_wallCache && (now - _wallCacheAt) < WALL_CACHE_TTL){
-      return res.json(_wallCache);
-    }
-
     const { rows: posts } = await pool.query(`
       SELECT p.id, p.username, p.content, p.deleted, p.muted, p.created_at,
              COUNT(DISTINCT c.id) FILTER (WHERE c.deleted=FALSE AND c.parent_id IS NULL) as comment_count
@@ -747,10 +738,7 @@ app.get('/api/wall', async (req, res) => {
       reactionMap[r.post_id].push({ emoji: r.emoji, count: parseInt(r.count), users: r.users });
     });
 
-    const result = posts.map(p => ({ ...p, reactions: reactionMap[p.id] || [] }));
-    _wallCache = result;
-    _wallCacheAt = now;
-    res.json(result);
+    res.json(posts.map(p => ({ ...p, reactions: reactionMap[p.id] || [] })));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
