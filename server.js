@@ -102,6 +102,16 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS payment_notifications (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL,
+      context TEXT NOT NULL,
+      payment_type TEXT,
+      amount INT,
+      seen BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS wall_posts (
       id SERIAL PRIMARY KEY,
       username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -391,6 +401,70 @@ app.patch('/api/users/:username/pin', async (req, res) => {
   try {
     await pool.query('UPDATE users SET pin = $1 WHERE username = $2',
       [pin, req.params.username]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  PAYMENT NOTIFICATIONS — usuario avisa que ya pagó
+// ══════════════════════════════════════════════════════
+
+// Crear notificación (usuario hace click en "Ya hice mi pago")
+app.post('/api/payment-notification', async (req, res) => {
+  const { username, context, amount, type } = req.body;
+  if(!username) return res.status(400).json({ error: 'username requerido' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO payment_notifications (username, context, payment_type, amount)
+       VALUES ($1, $2, $3, $4) RETURNING id, created_at`,
+      [String(username).slice(0, 80), String(context || 'signup').slice(0, 30), String(type || '').slice(0, 30), parseInt(amount) || 0]
+    );
+    res.json({ ok: true, id: rows[0].id, created_at: rows[0].created_at });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Listar notificaciones (admin ve la campana)
+app.get('/api/payment-notifications', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, username, context, payment_type, amount, seen, created_at
+       FROM payment_notifications
+       ORDER BY created_at DESC LIMIT 100`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Marcar como vista
+app.post('/api/payment-notifications/:id/seen', async (req, res) => {
+  try {
+    await pool.query('UPDATE payment_notifications SET seen = TRUE WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Marcar todas como vistas
+app.post('/api/payment-notifications/seen-all', async (req, res) => {
+  try {
+    await pool.query('UPDATE payment_notifications SET seen = TRUE WHERE seen = FALSE');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Eliminar notificación
+app.delete('/api/payment-notifications/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM payment_notifications WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
