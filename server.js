@@ -1197,16 +1197,15 @@ app.get('/api/stats', async (req, res) => {
     const mostExact = sortedByExact[0] ? { id: sortedByExact[0][0], ...sortedByExact[0][1] } : null;
     const leastCorrect = sortedByPct.length ? { id: sortedByPct[sortedByPct.length-1][0], ...sortedByPct[sortedByPct.length-1][1] } : null;
 
-    // 3. Equipo más votado como campeón (último partido del bracket)
+    // 3. Equipo más votado como campeón (ganador de la FINAL = f_0)
+    // IMPORTANTE: el ID de la final es 'f_0'. NO tomar el último key alfabético
+    // porque 'tp_0' (3er lugar) viene después de 'f_0' alfabéticamente.
     const champVotes = {};
     allPicks.forEach(p => {
       const br = p.data?.br || {};
-      const keys = Object.keys(br);
-      // Find the pick with highest match number (the final)
-      const finalKey = keys.sort().reverse()[0];
-      if(finalKey && br[finalKey]){
-        const team = br[finalKey];
-        champVotes[team] = (champVotes[team]||0) + 1;
+      const champion = br['f_0'];
+      if(champion){
+        champVotes[champion] = (champVotes[champion]||0) + 1;
       }
     });
     const topChamp = Object.entries(champVotes).sort((a,b)=>b[1]-a[1]).slice(0,3)
