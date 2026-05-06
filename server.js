@@ -685,6 +685,40 @@ async function logToSheet(payload) {
   }
 }
 
+// Endpoint de "backfill" — manda al Google Sheet TODOS los usuarios ya aprobados.
+// Útil para poblar el sheet con los usuarios anteriores a la integración.
+// Protegido por SHEET_TOKEN (la misma que tienes configurada en Railway).
+// Uso: POST /api/admin/sheet-backfill con header X-Sheet-Token: tu_token
+app.post('/api/admin/sheet-backfill', async (req, res) => {
+  const token = req.headers['x-sheet-token'] || req.body?.token;
+  if (!token || token !== process.env.SHEET_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT username, full_name, is_pro, created_at
+       FROM users
+       WHERE approved = TRUE AND is_admin = FALSE
+       ORDER BY created_at ASC`
+    );
+    let count = 0;
+    for (const u of rows) {
+      await logToSheet({
+        full_name: u.full_name || u.username,
+        username: u.username,
+        tipo: u.is_pro ? 'Pro' : 'User',
+        monto: u.is_pro ? 350 : 99
+      });
+      count++;
+      // Pequeña pausa para no saturar el Apps Script (max ~6 req/seg)
+      await new Promise(r => setTimeout(r, 200));
+    }
+    res.json({ ok: true, total: count });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/ranking', async (req, res) => {
   try {
     const now = Date.now();
