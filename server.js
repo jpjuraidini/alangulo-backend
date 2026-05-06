@@ -341,12 +341,20 @@ app.post('/api/users/:username/approve', async (req, res) => {
       proValue = u.rows[0]?.requested_type === 'pro';
     }
     const result = await pool.query(
-      'UPDATE users SET approved = TRUE, is_pro = $2 WHERE username = $1 RETURNING username, is_pro',
+      'UPDATE users SET approved = TRUE, is_pro = $2 WHERE username = $1 RETURNING username, is_pro, full_name',
       [req.params.username.toLowerCase(), !!proValue]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
     invalidateRankingCache();
-    res.json({ ok: true, is_pro: result.rows[0].is_pro });
+    // Log al Google Sheet (no bloquea el response)
+    const u = result.rows[0];
+    logToSheet({
+      full_name: u.full_name || u.username,
+      username: u.username,
+      tipo: u.is_pro ? 'Pro' : 'User',
+      monto: u.is_pro ? 350 : 99
+    });
+    res.json({ ok: true, is_pro: u.is_pro });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -361,11 +369,19 @@ app.post('/api/users/:username/upgrade-pro', async (req, res) => {
       return res.status(403).json({ error: 'El upgrade a Pro no está disponible una vez iniciado el torneo' });
     }
     const result = await pool.query(
-      'UPDATE users SET is_pro = TRUE WHERE username = $1 AND approved = TRUE RETURNING username',
+      'UPDATE users SET is_pro = TRUE WHERE username = $1 AND approved = TRUE RETURNING username, full_name',
       [req.params.username.toLowerCase()]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado o no aprobado' });
     invalidateRankingCache();
+    // Log al Google Sheet (upgrade = pagó $275 adicionales)
+    const u = result.rows[0];
+    logToSheet({
+      full_name: u.full_name || u.username,
+      username: u.username,
+      tipo: 'Upgrade User → Pro',
+      monto: 275
+    });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -641,6 +657,32 @@ async function buildSimulatedRanking() {
 function invalidateRankingCache() {
   _rankingCache = null;
   _rankingCacheAt = 0;
+}
+
+// ── Google Sheets logging ──
+// Manda los datos del usuario aprobado a un Google Apps Script que los escribe en una Sheet.
+// Configurar SHEET_WEBHOOK_URL y SHEET_TOKEN como variables de entorno en Railway.
+// Si no están configuradas, simplemente no hace nada (no crashea).
+async function logToSheet(payload) {
+  const url = process.env.SHEET_WEBHOOK_URL;
+  const token = process.env.SHEET_TOKEN;
+  if (!url || !token) {
+    // No configurado, silencioso
+    return;
+  }
+  try {
+    // Node 18+ tiene fetch nativo
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, token }),
+      // Timeout de 5s para no bloquear el flujo principal si Apps Script tarda
+      signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined
+    });
+  } catch (e) {
+    // No queremos que un error del Sheet afecte la aprobación
+    console.error('[logToSheet] Error:', e.message);
+  }
 }
 
 app.get('/api/ranking', async (req, res) => {
