@@ -387,6 +387,22 @@ app.post('/api/users/:username/reject', async (req, res) => {
   }
 });
 
+// Revertir aprobación: poner a un usuario aprobado de vuelta como pendiente
+// (útil si el admin aprobó por error)
+app.post('/api/users/:username/unapprove', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE users SET approved = FALSE WHERE username = $1 AND is_admin = FALSE RETURNING username',
+      [req.params.username.toLowerCase()]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    invalidateRankingCache();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Eliminar usuario
 app.delete('/api/users/:username', async (req, res) => {
   try {
