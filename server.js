@@ -658,7 +658,7 @@ const PTS_SERVER = {
 
 // ── BONUS DE CLASIFICACIÓN POR RONDA ──
 const PTS_CLASIFICADOS_SERVER = {
-  r32: 1, r16: 2, qf: 3, sf: 5, f: 8
+  r32: 1, r16: 2, qf: 4, sf: 8, f: 16
 };
 
 // ── GRUPOS (debe coincidir con frontend GROUPS) ──
