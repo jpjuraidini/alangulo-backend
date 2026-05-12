@@ -112,6 +112,14 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- Clasificados oficiales por ronda (lo que el admin marca como "estos pasaron")
+    -- Una fila por ronda con un array JSON de códigos de equipos
+    CREATE TABLE IF NOT EXISTS qualifiers (
+      round TEXT PRIMARY KEY,
+      teams JSONB NOT NULL DEFAULT '[]',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS wall_posts (
       id SERIAL PRIMARY KEY,
       username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -508,6 +516,87 @@ app.delete('/api/payment-notifications/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+//  QUALIFIERS — Clasificados oficiales por ronda (admin)
+// ══════════════════════════════════════════════════════
+
+// GET: leer todos los clasificados
+app.get('/api/qualifiers', async (req, res) => {
+  try {
+    const rows = await getOficiales();
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT: actualizar la lista de una ronda
+app.put('/api/qualifiers/:round', async (req, res) => {
+  const round = req.params.round;
+  const { teams } = req.body || {};
+  // Validar ronda
+  if(!['r32','r16','qf','sf','f'].includes(round)){
+    return res.status(400).json({ error: 'Ronda inválida' });
+  }
+  // Validar teams (array de strings)
+  if(!Array.isArray(teams)){
+    return res.status(400).json({ error: 'teams debe ser un array' });
+  }
+  // Validar tamaño esperado
+  const expected = { r32: 32, r16: 16, qf: 8, sf: 4, f: 2 }[round];
+  if(teams.length > expected){
+    return res.status(400).json({ error: `Máximo ${expected} equipos para ${round}` });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO qualifiers (round, teams, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (round) DO UPDATE SET teams = $2::jsonb, updated_at = NOW()`,
+      [round, JSON.stringify(teams)]
+    );
+    invalidateRankingCache();
+    res.json({ ok: true, round, teams });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET: desglose de clasificados predichos vs oficiales para un usuario
+// Devuelve para cada ronda: { predicted: [...], official: [...], hits: [...], bonus: N }
+app.get('/api/qualifiers/breakdown/:username', async (req, res) => {
+  try {
+    const [picksRow, oficiales] = await Promise.all([
+      pool.query('SELECT data FROM picks WHERE username = $1', [req.params.username.toLowerCase()]),
+      getOficiales()
+    ]);
+    const picksData = picksRow.rows[0]?.data || { sc:{}, br:{} };
+    const result = {};
+    let total = 0;
+    ['r32','r16','qf','sf','f'].forEach(round => {
+      const predicted = Array.from(getUserPredictedQualifiersServer(picksData, round));
+      const official = oficiales[round] || [];
+      const officialSet = new Set(official);
+      const hits = predicted.filter(t => officialSet.has(t));
+      const bonus = hits.length * PTS_CLASIFICADOS_SERVER[round];
+      total += bonus;
+      result[round] = {
+        predicted,
+        official,
+        hits,
+        bonus,
+        ptsPerHit: PTS_CLASIFICADOS_SERVER[round]
+      };
+    });
+    result.totalBonus = total;
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  QUALIFIERS — END
+// ══════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════
 //  PICKS
 // ══════════════════════════════════════════════════════
 
@@ -567,7 +656,152 @@ const PTS_SERVER = {
   r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], tp:[10,20], f:[10,20]
 };
 
-function calcScoreServer(picksData, results) {
+// ── BONUS DE CLASIFICACIÓN POR RONDA ──
+const PTS_CLASIFICADOS_SERVER = {
+  r32: 1, r16: 2, qf: 3, sf: 5, f: 8
+};
+
+// ── GRUPOS (debe coincidir con frontend GROUPS) ──
+const GROUPS_SERVER = {
+  A:['MEX','RSA','KOR','CZE'], B:['CAN','BIH','QAT','SUI'],
+  C:['BRA','MAR','HAI','SCO'], D:['USA','PAR','AUS','TUR'],
+  E:['GER','CUW','CIV','ECU'], F:['NED','JPN','SWE','TUN'],
+  G:['BEL','EGY','IRN','NZL'], H:['ESP','CPV','KSA','URU'],
+  I:['FRA','SEN','IRQ','NOR'], J:['ARG','ALG','AUT','JOR'],
+  K:['POR','COD','UZB','COL'], L:['ENG','CRO','GHA','PAN']
+};
+
+// IDs de los 6 partidos de cada grupo (G1..G6)
+function groupMatchIds(g){
+  return [`${g}1`,`${g}2`,`${g}3`,`${g}4`,`${g}5`,`${g}6`];
+}
+
+// Calcula la tabla de un grupo dado un sc del usuario
+function standingsServer(g, sc){
+  const teams = GROUPS_SERVER[g];
+  const s = {};
+  teams.forEach(t => { s[t] = {pts:0,gf:0,ga:0,gd:0}; });
+  // Mapeo de partido → equipos según FIFA matchday order
+  const [t1,t2,t3,t4] = teams;
+  const matches = [
+    {id:`${g}1`, h:t1, a:t2}, {id:`${g}2`, h:t3, a:t4},
+    {id:`${g}3`, h:t1, a:t3}, {id:`${g}4`, h:t2, a:t4},
+    {id:`${g}5`, h:t1, a:t4}, {id:`${g}6`, h:t2, a:t3},
+  ];
+  matches.forEach(m => {
+    const r = sc[m.id];
+    if(r == null || r.h == null || r.a == null) return;
+    const hg = +r.h || 0, ag = +r.a || 0;
+    s[m.h].gf += hg; s[m.h].ga += ag; s[m.h].gd += hg - ag;
+    s[m.a].gf += ag; s[m.a].ga += hg; s[m.a].gd += ag - hg;
+    if(hg > ag) s[m.h].pts += 3;
+    else if(hg < ag) s[m.a].pts += 3;
+    else { s[m.h].pts += 1; s[m.a].pts += 1; }
+  });
+  return teams.slice().sort((a,b) => {
+    if(s[b].pts !== s[a].pts) return s[b].pts - s[a].pts;
+    if(s[b].gd !== s[a].gd) return s[b].gd - s[a].gd;
+    return s[b].gf - s[a].gf;
+  }).map(t => ({team:t, ...s[t]}));
+}
+
+// THIRD_RULES igual que frontend (artículo 12.6 FIFA 2026)
+const THIRD_RULES_SERVER = [
+  ['r32_1',  ['A','B','C','D','F']],
+  ['r32_4',  ['C','D','F','G','H']],
+  ['r32_6',  ['C','E','F','H','I']],
+  ['r32_7',  ['E','H','I','J','K']],
+  ['r32_8',  ['B','E','F','I','J']],
+  ['r32_9',  ['A','E','H','I','J']],
+  ['r32_12', ['E','F','G','I','J']],
+  ['r32_14', ['D','E','I','J','L']],
+];
+
+function assignThirdsServer(rules, best3Sorted, usedGroups, result){
+  if(rules.length === 0) return true;
+  const sorted = [...rules].sort((a,b) => {
+    const ca = a[1].filter(g => !usedGroups.has(g) && best3Sorted.some(x => x.grp === g)).length;
+    const cb = b[1].filter(g => !usedGroups.has(g) && best3Sorted.some(x => x.grp === g)).length;
+    return ca - cb;
+  });
+  const [slot, eligible] = sorted[0];
+  const rest = sorted.slice(1);
+  const candidates = best3Sorted.filter(x => eligible.includes(x.grp) && !usedGroups.has(x.grp));
+  for(const cand of candidates){
+    usedGroups.add(cand.grp);
+    result[slot] = cand.team;
+    if(assignThirdsServer(rest, best3Sorted, usedGroups, result)) return true;
+    usedGroups.delete(cand.grp);
+    delete result[slot];
+  }
+  return false;
+}
+
+// Devuelve los equipos que el usuario predice que clasifican a una ronda
+function getUserPredictedQualifiersServer(picksData, round){
+  if(!picksData) return new Set();
+  const sc = picksData.sc || {};
+  const br = picksData.br || {};
+
+  if(round === 'r32'){
+    const out = new Set();
+    // 2 primeros de cada grupo
+    Object.keys(GROUPS_SERVER).forEach(g => {
+      const ids = groupMatchIds(g);
+      const played = ids.filter(id => sc[id] != null).length;
+      if(played === 0) return;
+      const st = standingsServer(g, sc);
+      if(st[0]) out.add(st[0].team);
+      if(st[1]) out.add(st[1].team);
+    });
+    // 8 mejores terceros con backtracking
+    const thirds = [];
+    Object.keys(GROUPS_SERVER).forEach(g => {
+      const ids = groupMatchIds(g);
+      const played = ids.filter(id => sc[id] != null).length;
+      if(played === 0) return;
+      const st = standingsServer(g, sc);
+      const t = st[2];
+      if(t) thirds.push({team:t.team, pts:t.pts, gd:t.gd, gf:t.gf, grp:g});
+    });
+    thirds.sort((a,b) => b.pts !== a.pts ? b.pts - a.pts : b.gd !== a.gd ? b.gd - a.gd : b.gf - a.gf);
+    const top8 = thirds.slice(0, 8);
+    const result = {};
+    assignThirdsServer(THIRD_RULES_SERVER, top8, new Set(), result);
+    Object.values(result).forEach(team => { if(team) out.add(team); });
+    return out;
+  }
+
+  // Para r16/qf/sf/f: leer winners del bracket en la ronda anterior
+  const sourceRound = round === 'r16' ? 'r32'
+                    : round === 'qf'  ? 'r16'
+                    : round === 'sf'  ? 'qf'
+                    : round === 'f'   ? 'sf'
+                    : null;
+  if(!sourceRound) return new Set();
+  const out = new Set();
+  Object.entries(br).forEach(([id, team]) => {
+    if(id.startsWith(sourceRound + '_') && team) out.add(team);
+  });
+  return out;
+}
+
+// Calcula el bonus total de clasificación de un usuario dado los oficiales
+function calcClasificadosBonusServer(picksData, oficiales){
+  if(!oficiales) return 0;
+  let total = 0;
+  Object.keys(PTS_CLASIFICADOS_SERVER).forEach(round => {
+    const realList = oficiales[round];
+    if(!Array.isArray(realList) || realList.length === 0) return;
+    const predicted = getUserPredictedQualifiersServer(picksData, round);
+    let hits = 0;
+    realList.forEach(team => { if(predicted.has(team)) hits++; });
+    total += hits * PTS_CLASIFICADOS_SERVER[round];
+  });
+  return total;
+}
+
+function calcScoreServer(picksData, results, oficiales) {
   let gr = 0, br = 0;
   const up = picksData || { sc: {}, br: {} };
 
@@ -602,7 +836,10 @@ function calcScoreServer(picksData, results) {
     });
   }
 
-  return { grupos: gr, bracket: br, total: gr + br };
+  // Bonus de clasificación por ronda (oficiales marcados por admin)
+  const clasifBonus = calcClasificadosBonusServer(up, oficiales);
+
+  return { grupos: gr, bracket: br + clasifBonus, total: gr + br + clasifBonus, clasificados: clasifBonus };
 }
 
 // ══════════════════════════════════════════════════════
@@ -612,22 +849,32 @@ let _rankingCache = null;
 let _rankingCacheAt = 0;
 const RANKING_TTL = 2 * 60 * 1000; // 2 minutos
 
+// Helper: obtener oficiales (clasificados) como objeto { r32: [...], r16: [...], ... }
+async function getOficiales(){
+  try {
+    const { rows } = await pool.query('SELECT round, teams FROM qualifiers');
+    const out = {};
+    rows.forEach(r => { out[r.round] = Array.isArray(r.teams) ? r.teams : []; });
+    return out;
+  } catch(e){
+    return {};
+  }
+}
+
 async function buildRanking() {
-  const [picksRows, resultsRow, usersRow] = await Promise.all([
+  const [picksRows, resultsRow, usersRow, oficiales] = await Promise.all([
     pool.query('SELECT username, data FROM picks'),
     pool.query('SELECT data FROM results WHERE id = 1'),
-    pool.query('SELECT username, is_admin, approved, is_pro FROM users')
+    pool.query('SELECT username, is_admin, approved, is_pro FROM users'),
+    getOficiales()
   ]);
   const results = resultsRow.rows[0]?.data || {};
-  // Mapa de picks por username (vacío si no tiene)
   const picksMap = new Map(picksRows.rows.map(r => [r.username, r.data]));
-  // Iterar sobre USUARIOS aprobados Pros (no sobre picks) — así aparecen incluso quienes
-  // no han hecho predicciones aún
   const board = usersRow.rows
     .filter(u => u.is_admin !== true && u.approved !== false && u.is_pro !== false)
     .map(u => ({
       name: u.username,
-      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results)
+      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results, oficiales)
     }))
     .sort((a, b) => b.total - a.total);
   _rankingCache = board;
@@ -636,12 +883,12 @@ async function buildRanking() {
 }
 
 // Ranking simulado para Users (incluye TODOS los aprobados, Pros + Users)
-// Sirve para mostrar "si fueras Pro estarías en el lugar #X"
 async function buildSimulatedRanking() {
-  const [picksRows, resultsRow, usersRow] = await Promise.all([
+  const [picksRows, resultsRow, usersRow, oficiales] = await Promise.all([
     pool.query('SELECT username, data FROM picks'),
     pool.query('SELECT data FROM results WHERE id = 1'),
-    pool.query('SELECT username, is_admin, approved FROM users')
+    pool.query('SELECT username, is_admin, approved FROM users'),
+    getOficiales()
   ]);
   const results = resultsRow.rows[0]?.data || {};
   const picksMap = new Map(picksRows.rows.map(r => [r.username, r.data]));
@@ -649,7 +896,7 @@ async function buildSimulatedRanking() {
     .filter(u => u.is_admin !== true && u.approved !== false)
     .map(u => ({
       name: u.username,
-      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results)
+      ...calcScoreServer(picksMap.get(u.username) || { sc: {}, br: {} }, results, oficiales)
     }))
     .sort((a, b) => b.total - a.total);
 }
@@ -1234,10 +1481,11 @@ app.delete('/api/ranking/snapshot/:id', async (req, res) => {
 // ══════════════════════════════════════════════════════
 app.get('/api/stats', async (req, res) => {
   try {
-    const [picksRows, resultsRow, usersRow] = await Promise.all([
+    const [picksRows, resultsRow, usersRow, oficiales] = await Promise.all([
       pool.query('SELECT username, data FROM picks'),
       pool.query('SELECT data FROM results WHERE id = 1'),
-      pool.query('SELECT username, is_admin, is_pro FROM users')
+      pool.query('SELECT username, is_admin, is_pro FROM users'),
+      getOficiales()
     ]);
 
     const results = resultsRow.rows[0]?.data || {};
@@ -1336,7 +1584,7 @@ app.get('/api/stats', async (req, res) => {
     // 7. La Tumba — el de menos puntos (todos ya tienen bracket completo por el filtro inicial)
     let tumba = null;
     if(allPicks.length){
-      const ranked = allPicks.map(p=>({name:p.username,...calcScoreServer(p.data,results)}))
+      const ranked = allPicks.map(p=>({name:p.username,...calcScoreServer(p.data,results,oficiales)}))
         .sort((a,b)=>a.total-b.total);
       tumba = ranked[0];
     }
