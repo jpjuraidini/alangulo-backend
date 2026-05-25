@@ -653,7 +653,7 @@ app.get('/api/picks', async (req, res) => {
 
 const PTS_SERVER = {
   grpResult: 1, grpExact: 2,
-  r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], tp:[10,20], f:[10,20]
+  r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], tp:[10,20], f:[32,20]
 };
 
 // ── BONUS DE CLASIFICACIÓN POR RONDA ──
