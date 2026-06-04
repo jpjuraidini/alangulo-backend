@@ -766,9 +766,10 @@ function getUserPredictedQualifiersServer(picksData, round){
     });
     thirds.sort((a,b) => b.pts !== a.pts ? b.pts - a.pts : b.gd !== a.gd ? b.gd - a.gd : b.gf - a.gf);
     const top8 = thirds.slice(0, 8);
-    const result = {};
-    assignThirdsServer(THIRD_RULES_SERVER, top8, new Set(), result);
-    Object.values(result).forEach(team => { if(team) out.add(team); });
+    // Para el bono de clasificación solo importa el CONJUNTO de los 8 mejores terceros,
+    // no a qué slot van. La asignación oficial por slot (Anexo C) se maneja en el cliente
+    // al construir el bracket; el scoring del server compara por slot contra lo del admin.
+    top8.forEach(t => { if(t.team) out.add(t.team); });
     return out;
   }
 
