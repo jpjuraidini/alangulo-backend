@@ -1,11 +1,12 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '200kb' }));
 
 // Prevent caching of API responses
 app.use((req, res, next) => {
@@ -19,6 +20,85 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// ══════════════════════════════════════════════════════
+//  AUTH — tokens HMAC firmados (sin tabla de sesiones)
+//  El login emite token = HMAC(username, AUTH_SECRET).
+//  El cliente lo manda en X-Auth-User / X-Auth-Token en cada escritura.
+// ══════════════════════════════════════════════════════
+const AUTH_SECRET = process.env.AUTH_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.AUTH_SECRET) {
+  console.warn('⚠️  AUTH_SECRET no configurado — usando secreto temporal. ' +
+    'Las sesiones se invalidarán en cada reinicio. Configura AUTH_SECRET en Railway.');
+}
+
+function mkToken(username){
+  return crypto.createHmac('sha256', AUTH_SECRET)
+    .update(String(username).toLowerCase()).digest('hex');
+}
+
+// Devuelve el username autenticado (lowercase) o null si el token no es válido.
+function tokenUser(req){
+  const u = String(req.headers['x-auth-user'] || '').toLowerCase();
+  const t = String(req.headers['x-auth-token'] || '');
+  if(!u || !t) return null;
+  const expected = mkToken(u);
+  const a = Buffer.from(t), b = Buffer.from(expected);
+  if(a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  return u;
+}
+
+// El que firma el request debe ser exactamente `username`.
+// Responde 401/403 y devuelve null si no; devuelve el username si sí.
+function requireUser(req, res, username){
+  const auth = tokenUser(req);
+  if(!auth){
+    res.status(401).json({ error: 'auth: Sesión inválida · vuelve a iniciar sesión' });
+    return null;
+  }
+  if(String(username || '').toLowerCase() !== auth){
+    res.status(403).json({ error: 'Sin permiso' });
+    return null;
+  }
+  return auth;
+}
+
+async function isAdminDb(username){
+  const { rows } = await pool.query('SELECT is_admin FROM users WHERE username=$1', [username]);
+  return !!rows[0]?.is_admin;
+}
+
+// Token válido + is_admin verificado en BD (nunca confiar en el cliente).
+async function requireAdmin(req, res){
+  const auth = tokenUser(req);
+  if(!auth){
+    res.status(401).json({ error: 'auth: Sesión inválida · vuelve a iniciar sesión' });
+    return null;
+  }
+  if(!(await isAdminDb(auth))){
+    res.status(403).json({ error: 'Solo admin' });
+    return null;
+  }
+  return auth;
+}
+
+// ── Rate limit de login (en memoria): máx 12 intentos fallidos / 10 min ──
+const loginAttempts = new Map(); // key → { n, t }
+const LOGIN_MAX = 12, LOGIN_WINDOW_MS = 10 * 60 * 1000;
+function loginLimited(key){
+  const rec = loginAttempts.get(key);
+  if(!rec) return false;
+  if(Date.now() - rec.t > LOGIN_WINDOW_MS){ loginAttempts.delete(key); return false; }
+  return rec.n >= LOGIN_MAX;
+}
+function loginFail(key){
+  if(loginAttempts.size > 5000) loginAttempts.clear(); // evitar crecimiento sin freno
+  const rec = loginAttempts.get(key) || { n: 0, t: Date.now() };
+  rec.n++;
+  loginAttempts.set(key, rec);
+}
+function loginOk(key){ loginAttempts.delete(key); }
+
 
 // ══════════════════════════════════════════════════════
 //  INIT DB — crea las tablas si no existen
@@ -206,13 +286,19 @@ async function initDB() {
 // Login
 app.post('/api/login', async (req, res) => {
   const { username, pin, refCode } = req.body;
+  const rlKey = `${req.headers['x-forwarded-for'] || req.ip || ''}|${String(username || '').toLowerCase()}`;
+  if (loginLimited(rlKey)) {
+    return res.status(429).json({ error: 'Demasiados intentos · espera 10 minutos' });
+  }
   try {
     const { rows } = await pool.query(
       'SELECT * FROM users WHERE username = $1', [username]
     );
     if (!rows.length || rows[0].pin !== pin) {
+      loginFail(rlKey);
       return res.status(401).json({ error: 'Usuario o PIN incorrecto' });
     }
+    loginOk(rlKey);
     const user = rows[0];
 
     // Bloquear si la cuenta no ha sido aprobada por un admin
@@ -244,7 +330,8 @@ app.post('/api/login', async (req, res) => {
       username: user.username,
       is_admin: user.is_admin,
       is_pro: user.is_pro !== false,
-      code: user.code
+      code: user.code,
+      token: mkToken(user.username)
     });
   } catch (e) {
     console.error(e);
@@ -270,6 +357,7 @@ app.get('/api/users', async (req, res) => {
 
 // Crear usuario (admin) — se crea ya aprobado
 app.post('/api/users', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   const { username, pin, code } = req.body;
   try {
     await pool.query(
@@ -340,6 +428,7 @@ app.post('/api/signup', async (req, res) => {
 
 // Aprobar inscripción (admin)
 app.post('/api/users/:username/approve', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     const { is_pro } = req.body || {};
     // Si no se especifica is_pro, se infiere del requested_type
@@ -370,6 +459,7 @@ app.post('/api/users/:username/approve', async (req, res) => {
 
 // Upgrade User → Pro (admin marca como pagado)
 app.post('/api/users/:username/upgrade-pro', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     // Bloqueo: no se puede upgrade después del 11 jun 2026 1pm CDMX (UTC-6 → 19:00 UTC)
     const cutoff = new Date('2026-06-11T19:00:00Z');
@@ -398,6 +488,7 @@ app.post('/api/users/:username/upgrade-pro', async (req, res) => {
 
 // Rechazar inscripción (admin) — borra al usuario pendiente
 app.post('/api/users/:username/reject', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     // Solo permitir borrar usuarios no aprobados y no admin
     await pool.query(
@@ -414,6 +505,7 @@ app.post('/api/users/:username/reject', async (req, res) => {
 // Revertir aprobación: poner a un usuario aprobado de vuelta como pendiente
 // (útil si el admin aprobó por error)
 app.post('/api/users/:username/unapprove', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     const result = await pool.query(
       'UPDATE users SET approved = FALSE WHERE username = $1 AND is_admin = FALSE RETURNING username',
@@ -429,6 +521,7 @@ app.post('/api/users/:username/unapprove', async (req, res) => {
 
 // Eliminar usuario
 app.delete('/api/users/:username', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     await pool.query('DELETE FROM users WHERE username = $1 AND is_admin = FALSE',
       [req.params.username]);
@@ -441,6 +534,7 @@ app.delete('/api/users/:username', async (req, res) => {
 
 // Cambiar PIN
 app.patch('/api/users/:username/pin', async (req, res) => {
+  if(!requireUser(req, res, req.params.username)) return;
   const { pin } = req.body;
   try {
     await pool.query('UPDATE users SET pin = $1 WHERE username = $2',
@@ -487,6 +581,7 @@ app.get('/api/payment-notifications', async (req, res) => {
 
 // Marcar como vista
 app.post('/api/payment-notifications/:id/seen', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     await pool.query('UPDATE payment_notifications SET seen = TRUE WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
@@ -497,6 +592,7 @@ app.post('/api/payment-notifications/:id/seen', async (req, res) => {
 
 // Marcar todas como vistas
 app.post('/api/payment-notifications/seen-all', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     await pool.query('UPDATE payment_notifications SET seen = TRUE WHERE seen = FALSE');
     res.json({ ok: true });
@@ -507,6 +603,7 @@ app.post('/api/payment-notifications/seen-all', async (req, res) => {
 
 // Eliminar notificación
 app.delete('/api/payment-notifications/:id', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     await pool.query('DELETE FROM payment_notifications WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
@@ -531,6 +628,7 @@ app.get('/api/qualifiers', async (req, res) => {
 
 // PUT: actualizar la lista de una ronda
 app.put('/api/qualifiers/:round', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   const round = req.params.round;
   const { teams } = req.body || {};
   // Validar ronda
@@ -617,6 +715,7 @@ app.get('/api/picks/:username', async (req, res) => {
 const TOURNAMENT_START_MS_SERVER = Date.parse('2026-06-11T13:00:00-06:00');
 
 app.post('/api/picks/:username', async (req, res) => {
+  if(!requireUser(req, res, req.params.username)) return;
   // Bloqueo defensivo: no aceptar picks después del inicio del torneo
   if (Date.now() >= TOURNAMENT_START_MS_SERVER) {
     return res.status(403).json({ error: 'El torneo ya empezó · Predicciones cerradas' });
@@ -974,6 +1073,7 @@ app.get('/api/results', async (req, res) => {
 });
 
 app.post('/api/results', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   const { data } = req.body;
   try {
     await pool.query(
@@ -993,6 +1093,7 @@ app.post('/api/results', async (req, res) => {
 
 // Register referral separately (from welcome modal)
 app.post('/api/refs_register', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username, refCode } = req.body;
   if (!username || !refCode) return res.json({ ok: false });
   try {
@@ -1058,6 +1159,7 @@ app.get('/api/wall', async (req, res) => {
 
 // Create post
 app.post('/api/wall', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username, content } = req.body;
   if(!username||!content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
   try {
@@ -1075,7 +1177,10 @@ app.post('/api/wall', async (req, res) => {
 
 // Delete post (own or admin)
 app.delete('/api/wall/:id', async (req, res) => {
-  const { username, isAdmin } = req.body;
+  // Identidad por token; admin verificado en BD (no confiar en el body)
+  const username = tokenUser(req);
+  if(!username) return res.status(401).json({ error: 'auth: Sesión inválida · vuelve a iniciar sesión' });
+  const isAdmin = await isAdminDb(username);
   try {
     const { rows } = await pool.query('SELECT username, delete_count FROM wall_posts WHERE id=$1', [req.params.id]);
     if(!rows.length) return res.status(404).json({ error: 'Post no encontrado' });
@@ -1104,6 +1209,7 @@ app.delete('/api/wall/:id', async (req, res) => {
 
 // Toggle reaction
 app.post('/api/wall/:id/react', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username, emoji } = req.body;
   if(!username||!emoji) return res.status(400).json({ error: 'Faltan datos' });
   try {
@@ -1149,6 +1255,7 @@ app.get('/api/wall/:id/comments', async (req, res) => {
 
 // Add comment
 app.post('/api/wall/:id/comments', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username, content, parent_id } = req.body;
   if(!username||!content?.trim()) return res.status(400).json({ error: 'Faltan datos' });
   try {
@@ -1172,8 +1279,10 @@ app.delete('/api/wall/comments/:id', async (req, res) => {
 });
 
 async function deleteCommentHandler(req, res){
-  const { username, is_admin, isAdmin } = req.body;
-  const admin = is_admin || isAdmin;
+  // Identidad por token; admin verificado en BD (no confiar en el body)
+  const username = tokenUser(req);
+  if(!username) return res.status(401).json({ error: 'auth: Sesión inválida · vuelve a iniciar sesión' });
+  const admin = await isAdminDb(username);
   try {
     const { rows } = await pool.query('SELECT username, post_id FROM wall_comments WHERE id=$1 AND deleted=FALSE', [req.params.id]);
     if(!rows.length) return res.status(404).json({ error: 'Comentario no encontrado' });
@@ -1250,6 +1359,7 @@ function genGroupCode(){
 
 // Crear grupo
 app.post('/api/groups', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { name, username } = req.body;
   if(!name||!username) return res.status(400).json({error:'Faltan datos'});
   let code, attempts=0;
@@ -1280,6 +1390,7 @@ app.post('/api/groups', async (req, res) => {
 
 // Unirse a un grupo por código
 app.post('/api/groups/join', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { code, username } = req.body;
   if(!code||!username) return res.status(400).json({error:'Faltan datos'});
   try {
@@ -1338,6 +1449,7 @@ app.get('/api/groups/:id/ranking', async (req, res) => {
 
 // Eliminar miembro del grupo (solo el owner)
 app.delete('/api/groups/:id/member/:username', async (req, res) => {
+  if(!requireUser(req, res, req.body?.requester)) return;
   const { requester } = req.body;
   try {
     const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
@@ -1353,6 +1465,7 @@ app.delete('/api/groups/:id/member/:username', async (req, res) => {
 
 // Salir de un grupo
 app.delete('/api/groups/:id/leave', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username } = req.body;
   try {
     const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
@@ -1367,6 +1480,7 @@ app.delete('/api/groups/:id/leave', async (req, res) => {
 
 // Eliminar grupo (solo el creador)
 app.delete('/api/groups/:id', async (req, res) => {
+  if(!requireUser(req, res, req.body?.username)) return;
   const { username } = req.body;
   try {
     const { rows } = await pool.query('SELECT owner FROM groups_q WHERE id=$1',[req.params.id]);
@@ -1395,6 +1509,7 @@ app.get('/api/wall/strikes/:username', async (req, res) => {
 
 // Admin: unmute user
 app.post('/api/wall/unmute', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   const { username } = req.body;
   try {
     await pool.query('UPDATE wall_strikes SET muted=FALSE, strikes=0 WHERE username=$1', [username]);
@@ -1410,6 +1525,7 @@ app.post('/api/wall/unmute', async (req, res) => {
 
 // Guardar snapshot del ranking (lo llama el admin)
 app.post('/api/ranking/snapshot', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   const { label } = req.body;
   if(!label) return res.status(400).json({ error: 'Se requiere un label' });
   try {
@@ -1438,6 +1554,7 @@ app.get('/api/ranking/history', async (req, res) => {
 
 // Eliminar un snapshot
 app.delete('/api/ranking/snapshot/:id', async (req, res) => {
+  if(!(await requireAdmin(req, res))) return;
   try {
     await pool.query('DELETE FROM ranking_history WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
