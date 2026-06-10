@@ -705,37 +705,6 @@ function standingsServer(g, sc){
   }).map(t => ({team:t, ...s[t]}));
 }
 
-// THIRD_RULES igual que frontend (artículo 12.6 FIFA 2026)
-const THIRD_RULES_SERVER = [
-  ['r32_1',  ['A','B','C','D','F']],
-  ['r32_4',  ['C','D','F','G','H']],
-  ['r32_6',  ['C','E','F','H','I']],
-  ['r32_7',  ['E','H','I','J','K']],
-  ['r32_8',  ['B','E','F','I','J']],
-  ['r32_9',  ['A','E','H','I','J']],
-  ['r32_12', ['E','F','G','I','J']],
-  ['r32_14', ['D','E','I','J','L']],
-];
-
-function assignThirdsServer(rules, best3Sorted, usedGroups, result){
-  if(rules.length === 0) return true;
-  const sorted = [...rules].sort((a,b) => {
-    const ca = a[1].filter(g => !usedGroups.has(g) && best3Sorted.some(x => x.grp === g)).length;
-    const cb = b[1].filter(g => !usedGroups.has(g) && best3Sorted.some(x => x.grp === g)).length;
-    return ca - cb;
-  });
-  const [slot, eligible] = sorted[0];
-  const rest = sorted.slice(1);
-  const candidates = best3Sorted.filter(x => eligible.includes(x.grp) && !usedGroups.has(x.grp));
-  for(const cand of candidates){
-    usedGroups.add(cand.grp);
-    result[slot] = cand.team;
-    if(assignThirdsServer(rest, best3Sorted, usedGroups, result)) return true;
-    usedGroups.delete(cand.grp);
-    delete result[slot];
-  }
-  return false;
-}
 
 // Devuelve los equipos que el usuario predice que clasifican a una ronda
 function getUserPredictedQualifiersServer(picksData, round){
