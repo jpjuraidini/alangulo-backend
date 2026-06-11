@@ -712,7 +712,7 @@ app.get('/api/picks/:username', async (req, res) => {
 
 // Guardar picks de un usuario
 // Cutoff del torneo (también validado en frontend)
-const TOURNAMENT_START_MS_SERVER = Date.parse('2026-06-11T13:00:00-06:00');
+const TOURNAMENT_START_MS_SERVER = Date.parse('2026-06-11T13:20:00-06:00'); // cierre 1:20pm CDMX (extendido 15 min)
 
 app.post('/api/picks/:username', async (req, res) => {
   if(!requireUser(req, res, req.params.username)) return;
