@@ -755,6 +755,13 @@ const PTS_SERVER = {
   r32:[2,4], r16:[3,6], qf:[5,10], sf:[7,14], tp:[10,20], f:[32,20]
 };
 
+// Marcador exacto de bracket, INDEPENDIENTE de local/visitante (debe coincidir con el cliente).
+// Solo se usa cuando el ganador ya se validó correcto, por eso aceptar ambas orientaciones es seguro.
+function brExactServer(ms, rr){
+  if(!ms || !rr || rr.h==null || rr.a==null || ms.h==null || ms.a==null) return false;
+  return (+ms.h===+rr.h && +ms.a===+rr.a) || (+ms.h===+rr.a && +ms.a===+rr.h);
+}
+
 // ── BONUS DE CLASIFICACIÓN POR RONDA ──
 const PTS_CLASIFICADOS_SERVER = {
   r32: 1, r16: 2, qf: 4, sf: 8, f: 16
@@ -900,7 +907,7 @@ function calcScoreServer(picksData, results, oficiales) {
       if (mw === rr.winner) {
         br += winPts;
         const ms = up.sc?.[id];
-        if (ms && rr.h != null && +ms.h === rr.h && +ms.a === rr.a) br += exactBonus;
+        if (brExactServer(ms, rr)) br += exactBonus;
       }
     });
   }
