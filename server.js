@@ -761,6 +761,16 @@ function brExactServer(ms, rr){
   if(!ms || !rr || rr.h==null || rr.a==null || ms.h==null || ms.a==null) return false;
   return (+ms.h===+rr.h && +ms.a===+rr.a) || (+ms.h===+rr.a && +ms.a===+rr.h);
 }
+// Resultado del bracket A LOS 90 MIN (debe coincidir con el cliente brResult).
+function brResultServer(ms, mw, rr){
+  if(!ms || !rr || rr.h==null || rr.a==null || ms.h==null || ms.a==null || !rr.winner) return {win:false, exact:false};
+  const offDraw  = (+rr.h === +rr.a);
+  const userDraw = (+ms.h === +ms.a);
+  const advancerOk = !!mw && (mw === rr.winner);
+  const resultTypeOk = offDraw ? userDraw : !userDraw;
+  const win = advancerOk && resultTypeOk;
+  return { win, exact: win && brExactServer(ms, rr) };
+}
 
 // ── BONUS DE CLASIFICACIÓN POR RONDA ──
 const PTS_CLASIFICADOS_SERVER = {
@@ -902,12 +912,10 @@ function calcScoreServer(picksData, results, oficiales) {
       if (!rr?.winner) return;
       const rk = id.split('_')[0];
       const [winPts, exactBonus] = PTS_SERVER[rk] || [0, 0];
-      const mw = up.br?.[id];
-      if (!mw) return;
-      if (mw === rr.winner) {
+      const r = brResultServer(up.sc?.[id], up.br?.[id], rr);
+      if (r.win) {
         br += winPts;
-        const ms = up.sc?.[id];
-        if (brExactServer(ms, rr)) br += exactBonus;
+        if (r.exact) br += exactBonus;
       }
     });
   }
